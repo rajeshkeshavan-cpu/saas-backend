@@ -48,6 +48,7 @@ app.get('/nearest', async (req, res) => {
 io.on('connection', (socket) => {
   console.log(`✅ Connected: ${socket.id}`);
   socket.on('driver:location:update', async (data) => {
+   console.log(`📍 ${data.driver_id} ${data.lat},${data.lng}`);
     const { tenant_id, driver_id, lat, lng } = data;
     const key = `tenant:${tenant_id}:drivers:geo`;
     await redis.geoadd(key, lng, lat, driver_id);
