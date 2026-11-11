@@ -9,8 +9,6 @@ app.use(express.urlencoded({ extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Phase 3 running on PORT ${PORT}`));
 
 redis.on('connect', () => console.log('✅ Redis connected'));
 
