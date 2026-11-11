@@ -1,0 +1,24 @@
+Customer selects pickup location (A).
+Customer selects destination (B).
+Calculate distance and estimated fare.
+Search for nearby available drivers.
+Send ride request to driver.
+
+Phase 2 – Driver acceptance
+Driver receives booking notification.
+Accept or reject ride.
+Customer sees driver details.
+Live driver tracking.
+
+Phase 3 – Payment
+Integrate Stripe Payment Sheet.
+Backend creates payment requests.
+Verify payments securely using webhooks.
+Generate ride receipt.
+
+Phase 4 – Production readiness
+Customer and driver registration.
+Authentication and security.
+Ride history.
+Admin dashboard.
+Cancellation and refund handling.
