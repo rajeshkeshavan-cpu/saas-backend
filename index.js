@@ -99,6 +99,21 @@ app.post('/rides/:id/decline', async (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/rides/:id/cancel', async (req, res) => {
+  const ride = rides.get(req.params.id);
+  if (!ride) return res.status(404).json({error: 'Ride not found'});
+  const { cancelled_by, reason } = req.body;
+  ride.status = 'CANCELLED';
+  ride.cancelled_by = cancelled_by || 'unknown';
+  ride.cancel_reason = reason || 'No reason';
+  ride.cancelled_at = new Date().toISOString();
+  rides.set(ride.ride_id, ride);
+  await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
+  console.log(`❌ Ride ${ride.ride_id} cancelled by ${ride.cancelled_by}: ${ride.cancel_reason}`);
+  io.emit('ride:cancelled', ride);
+  res.json({ success: true, ride });
+});
+
 app.post('/rides/:id/arrived', async (req, res) => {
   const ride = rides.get(req.params.id);
   if (!ride) return res.status(404).json({error: 'Ride not found'});
