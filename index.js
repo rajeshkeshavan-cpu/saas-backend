@@ -14,6 +14,7 @@ redis.on('connect', () => console.log('✅ Redis connected'));
 redis.on('error', (err) => console.log('Redis error:', err.message));
 
 const rides = new Map();
+global.onlineDrivers = {};
 
 app.get('/', (req, res) => {
   res.send('SaaS Driver Backend - Phase 3 - Running');
@@ -45,14 +46,84 @@ app.get('/nearest', async (req, res) => {
   }
 });
 
+// NEW: Drivers list for customer app - MUST BE BEFORE listen!
+app.get('/drivers', async (req, res) => {
+  try {
+    const driverKeys = await redis.keys('driver:*:location');
+    let drivers = [];
+    for (let key of driverKeys) {
+      const data = await redis.hgetall(key);
+      if (data && data.lat) {
+        let driverId = key.split(':')[1];
+        drivers.push({
+          driver_id: driverId,
+          lat: parseFloat(data.lat),
+          lng: parseFloat(data.lng),
+          last_seen: data.updated_at,
+          online: true
+        });
+      }
+    }
+    // Merge with in-memory
+    for (let id in global.onlineDrivers) {
+      if (!drivers.find(d => d.driver_id === id)) {
+        drivers.push(global.onlineDrivers[id]);
+      }
+    }
+    res.json(drivers);
+  } catch (e) {
+    console.log('drivers error', e.message);
+    res.json([]);
+  }
+});
+
+// NEW: Customer registration with PIN
+app.post('/customer/register', async (req, res) => {
+  try {
+    let { phone } = req.body;
+    if (!phone || phone.length != 10) return res.status(400).json({ error: "10 digit phone required" });
+    let existing = await redis.hgetall(`customer:${phone}`);
+    if (existing && existing.pin) {
+      return res.json({ phone, pin: existing.pin, existing: true });
+    }
+    let pin = Math.floor(1000 + Math.random() * 9000).toString();
+    await redis.hset(`customer:${phone}`, { pin, phone, created: new Date().toISOString() });
+    console.log(`📱 Customer ${phone} PIN ${pin}`);
+    res.json({ phone, pin });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// NEW: Driver selfie upload (mock verification)
+app.post('/driver/:id/selfie', async (req, res) => {
+  console.log(`📸 Selfie received for ${req.params.id}`);
+  res.json({ verified: true, driver_id: req.params.id });
+});
+
+app.post('/driver/location', async (req, res) => {
+  const { driver_id, lat, lng } = req.body;
+  if (!driver_id || !lat || !lng) return res.status(400).json({ error: "Missing" });
+  await redis.hset(`driver:${driver_id}:location`, { lat, lng, updated_at: Date.now() });
+  global.onlineDrivers[driver_id] = { driver_id, lat, lng, last_seen: Date.now(), online: true };
+  res.json({ success: true });
+});
+
 io.on('connection', (socket) => {
   console.log(`✅ Connected: ${socket.id}`);
   socket.on('driver:location:update', async (data) => {
-   console.log(`📍 ${data.driver_id} ${data.lat},${data.lng}`);
-    const { tenant_id, driver_id, lat, lng } = data;
-    const key = `tenant:${tenant_id}:drivers:geo`;
-    await redis.geoadd(key, lng, lat, driver_id);
-    io.emit('driver:location', { driver_id, lat, lng });
+    try {
+      const { tenant_id, driver_id, lat, lng } = data;
+      if (!driver_id || !lat || !lng) return;
+      await redis.hset(`driver:${driver_id}:location`, { lat, lng, updated_at: Date.now() });
+      global.onlineDrivers[driver_id] = { driver_id, lat, lng, last_seen: Date.now(), online: true };
+      console.log(`📍 ${driver_id} ${lat},${lng}`);
+      const key = `tenant:${tenant_id || 'TENANT_01'}:drivers:geo`;
+      await redis.geoadd(key, lng, lat, driver_id);
+      io.emit('driver:location', { driver_id, lat, lng });
+    } catch (e) {
+      console.log('location error', e.message);
+    }
   });
   socket.on('join:ride', (ride_id) => {
     socket.join(ride_id);
@@ -60,12 +131,14 @@ io.on('connection', (socket) => {
 });
 
 app.post('/rides/request', async (req, res) => {
-  const { tenant_id, customer_id, from, to, distance_km, fare } = req.body;
+  const { tenant_id, customer_id, customer_phone, customer_pin, from, to, distance_km, fare } = req.body;
   const ride_id = `RIDE_${Date.now()}`;
   const ride = {
     ride_id,
     tenant_id: tenant_id || 'TENANT_01',
-    customer_id,
+    customer_id: customer_id || customer_phone,
+    customer_phone,
+    customer_pin,
     from, to, distance_km, fare,
     status: 'REQUESTED',
     driver_id: null,
@@ -73,7 +146,7 @@ app.post('/rides/request', async (req, res) => {
   };
   rides.set(ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride_id, JSON.stringify(ride));
-  console.log(`🚕 Ride ${ride_id} Fare ₹${fare}`);
+  console.log(`🚕 Ride ${ride_id} Phone ${customer_phone} PIN ${customer_pin} Fare ₹${fare}`);
   io.emit('ride:request', ride);
   res.json({ success: true, ride });
 });
@@ -128,6 +201,11 @@ app.post('/rides/:id/arrived', async (req, res) => {
 app.post('/rides/:id/start', async (req, res) => {
   const ride = rides.get(req.params.id);
   if (!ride) return res.status(404).json({error: 'Ride not found'});
+  // Optional PIN verification
+  const { pin } = req.body;
+  if (pin && ride.customer_pin && pin != ride.customer_pin) {
+    return res.status(400).json({ error: `Wrong PIN. Expected ${ride.customer_pin}` });
+  }
   ride.status = 'STARTED';
   ride.started_at = new Date().toISOString();
   rides.set(ride.ride_id, ride);
@@ -161,11 +239,9 @@ app.get('/rides/:id', async (req, res) => {
 
 app.get('/rides', async (req, res) => {
   try {
-    // Try to get from Redis for persistence across restarts
     const allRedis = await redis.hgetall('tenant:TENANT_01:rides');
     const redisRides = Object.values(allRedis).map(v => { try { return JSON.parse(v); } catch(e) { return null; } }).filter(Boolean);
     const memRides = Array.from(rides.values());
-    // Merge both, mem wins
     const merged = new Map();
     redisRides.forEach(r => merged.set(r.ride_id, r));
     memRides.forEach(r => merged.set(r.ride_id, r));
@@ -174,5 +250,6 @@ app.get('/rides', async (req, res) => {
     res.json(Array.from(rides.values()));
   }
 });
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Phase 3 running on PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Phase 3 - Drivers + PIN running on PORT ${PORT}`));
