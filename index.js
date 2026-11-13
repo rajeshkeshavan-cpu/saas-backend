@@ -147,15 +147,32 @@ app.post('/rides/:id/complete', async (req, res) => {
   res.json({ success: true, ride });
 });
 
-app.get('/rides/:id', (req, res) => {
-  const ride = rides.get(req.params.id);
+app.get('/rides/:id', async (req, res) => {
+  let ride = rides.get(req.params.id);
+  if (!ride) {
+    try {
+      const data = await redis.hget('tenant:TENANT_01:rides', req.params.id);
+      if (data) ride = JSON.parse(data);
+    } catch(e) {}
+  }
   if (!ride) return res.status(404).json({error: 'Not found'});
   res.json(ride);
 });
 
-app.get('/rides', (req, res) => {
-  res.json(Array.from(rides.values()));
+app.get('/rides', async (req, res) => {
+  try {
+    // Try to get from Redis for persistence across restarts
+    const allRedis = await redis.hgetall('tenant:TENANT_01:rides');
+    const redisRides = Object.values(allRedis).map(v => { try { return JSON.parse(v); } catch(e) { return null; } }).filter(Boolean);
+    const memRides = Array.from(rides.values());
+    // Merge both, mem wins
+    const merged = new Map();
+    redisRides.forEach(r => merged.set(r.ride_id, r));
+    memRides.forEach(r => merged.set(r.ride_id, r));
+    res.json(Array.from(merged.values()));
+  } catch(e) {
+    res.json(Array.from(rides.values()));
+  }
 });
-
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Phase 3 running on PORT ${PORT}`));
