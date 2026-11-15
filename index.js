@@ -14,6 +14,21 @@ redis.on('connect', () => console.log('✅ Redis connected'));
 redis.on('error', (err) => console.log('Redis error:', err.message));
 
 const rides = new Map();
+
+// Render restarts / sleep wipe the in-memory Map, so fall back to Redis
+async function getRide(id) {
+  let ride = rides.get(id);
+  if (ride) return ride;
+  try {
+    const data = await redis.hget('tenant:TENANT_01:rides', id);
+    if (data) {
+      ride = JSON.parse(data);
+      rides.set(id, ride);
+      return ride;
+    }
+  } catch (e) {}
+  return null;
+}
 global.onlineDrivers = {};
 
 app.get('/', (req, res) => {
@@ -131,7 +146,8 @@ io.on('connection', (socket) => {
 });
 
 app.post('/rides/request', async (req, res) => {
-  const { tenant_id, customer_id, customer_phone, customer_pin, from, to, distance_km, fare } = req.body;
+  const { tenant_id, customer_id, customer_phone, customer_pin, from, to, distance_km, fare,
+          vehicle_type, eta_min, booked_for_other, passenger_name, passenger_phone } = req.body;
   const ride_id = `RIDE_${Date.now()}`;
   const ride = {
     ride_id,
@@ -140,6 +156,11 @@ app.post('/rides/request', async (req, res) => {
     customer_phone,
     customer_pin,
     from, to, distance_km, fare,
+    vehicle_type: vehicle_type || 'TAXI',
+    eta_min: eta_min || null,
+    booked_for_other: booked_for_other === true,
+    passenger_name: passenger_name || null,
+    passenger_phone: passenger_phone || null,
     status: 'REQUESTED',
     driver_id: null,
     created_at: new Date().toISOString()
@@ -152,9 +173,10 @@ app.post('/rides/request', async (req, res) => {
 });
 
 app.post('/rides/:id/accept', async (req, res) => {
-  const ride = rides.get(req.params.id);
+  const ride = await getRide(req.params.id);
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   const { driver_id } = req.body;
+  if (ride.status !== 'REQUESTED') return res.status(409).json({ error: 'Ride already taken or cancelled' });
   ride.status = 'ACCEPTED';
   ride.driver_id = driver_id;
   ride.accepted_at = new Date().toISOString();
@@ -165,7 +187,7 @@ app.post('/rides/:id/accept', async (req, res) => {
 });
 
 app.post('/rides/:id/decline', async (req, res) => {
-  const ride = rides.get(req.params.id);
+  const ride = await getRide(req.params.id);
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   ride.status = 'DECLINED';
   io.emit('ride:declined', ride);
@@ -173,7 +195,7 @@ app.post('/rides/:id/decline', async (req, res) => {
 });
 
 app.post('/rides/:id/cancel', async (req, res) => {
-  const ride = rides.get(req.params.id);
+  const ride = await getRide(req.params.id);
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   const { cancelled_by, reason } = req.body;
   ride.status = 'CANCELLED';
@@ -188,7 +210,7 @@ app.post('/rides/:id/cancel', async (req, res) => {
 });
 
 app.post('/rides/:id/arrived', async (req, res) => {
-  const ride = rides.get(req.params.id);
+  const ride = await getRide(req.params.id);
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   ride.status = 'ARRIVED';
   ride.arrived_at = new Date().toISOString();
@@ -199,7 +221,7 @@ app.post('/rides/:id/arrived', async (req, res) => {
 });
 
 app.post('/rides/:id/start', async (req, res) => {
-  const ride = rides.get(req.params.id);
+  const ride = await getRide(req.params.id);
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   // Optional PIN verification
   const { pin } = req.body;
@@ -215,7 +237,7 @@ app.post('/rides/:id/start', async (req, res) => {
 });
 
 app.post('/rides/:id/complete', async (req, res) => {
-  const ride = rides.get(req.params.id);
+  const ride = await getRide(req.params.id);
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   ride.status = 'COMPLETED';
   ride.completed_at = new Date().toISOString();
