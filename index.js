@@ -9,6 +9,10 @@ app.use(express.urlencoded({ extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
+// driver registration, document upload and admin verification
+const driverReg = require('./driver_registration');
+driverReg(app, io);
+
 const redis = new Redis(process.env.REDIS_URL || undefined, process.env.REDIS_URL ? { tls: {} } : {});
 redis.on('connect', () => console.log('✅ Redis connected'));
 redis.on('error', (err) => console.log('Redis error:', err.message));
@@ -119,6 +123,11 @@ app.post('/driver/:id/selfie', async (req, res) => {
 app.post('/driver/location', async (req, res) => {
   const { driver_id, lat, lng } = req.body;
   if (!driver_id || !lat || !lng) return res.status(400).json({ error: "Missing" });
+  if (process.env.REQUIRE_VERIFIED_DRIVERS === 'true' && !(await driverReg.isVerifiedRequest(req))) {
+    return res.status(403).json({ error: 'Driver not verified' });
+  }
+
+
   await redis.hset(`driver:${driver_id}:location`, { lat, lng, updated_at: Date.now() });
   global.onlineDrivers[driver_id] = { driver_id, lat, lng, last_seen: Date.now(), online: true };
   res.json({ success: true });
@@ -179,6 +188,14 @@ app.post('/rides/:id/accept', async (req, res) => {
   if (ride.status !== 'REQUESTED') return res.status(409).json({ error: 'Ride already taken or cancelled' });
   ride.status = 'ACCEPTED';
   ride.driver_id = driver_id;
+  try {
+    const dr = await driverReg.lookupDriver(driver_id);
+    if (dr) {
+      ride.driver_name = dr.name;
+      ride.vehicle_number = dr.vehicle_number;
+      ride.driver_verified = dr.status === 'VERIFIED';
+    }
+  } catch (e) {}
   ride.accepted_at = new Date().toISOString();
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
