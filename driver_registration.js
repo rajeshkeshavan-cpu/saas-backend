@@ -28,6 +28,16 @@ const upload = multer({
   fileFilter: (req, file, cb) => cb(null, !!EXT[file.mimetype]),
 });
 
+// runs multer but answers with JSON instead of an HTML error page
+const uploadOne = (req, res, next) =>
+  upload.single('file')(req, res, (err) => {
+    if (err) {
+      const big = err.code === 'LIMIT_FILE_SIZE';
+      return res.status(400).json({ error: big ? 'That photo is larger than 5 MB. Try again.' : 'Upload failed. Try again.' });
+    }
+    next();
+  });
+
 // ---------- helpers ----------
 const nowIso = () => new Date().toISOString();
 const newDriverId = () => 'DRV_' + crypto.randomBytes(3).toString('hex').toUpperCase();
@@ -148,7 +158,7 @@ function mount(app, io) {
   });
 
   // ----- driver: upload one document (multipart field "file") -----
-  app.post('/driver/docs/:type', needDb, requireDriver, upload.single('file'), async (req, res) => {
+  app.post('/driver/docs/:type', needDb, requireDriver, uploadOne, async (req, res) => {
     try {
       const type = String(req.params.type).toUpperCase();
       const d = req.driver;
