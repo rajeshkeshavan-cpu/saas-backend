@@ -172,18 +172,30 @@ function mount(app, io) {
         return res.status(500).json({ error: 'Could not save the document. Try again.' });
       }
 
-      // all required documents in -> send to review
       const { data: docs } = await supabase.from('driver_documents').select('doc_type').eq('driver_id', d.driver_id);
       const have = new Set((docs || []).map((x) => x.doc_type));
-      let status = d.status;
-      if (REQUIRED_DOCS.every((t) => have.has(t)) && ['DOCS_PENDING', 'REJECTED'].includes(d.status)) {
-        status = 'UNDER_REVIEW';
-        await supabase.from('drivers').update({ status, rejection_reason: null, updated_at: nowIso() }).eq('driver_id', d.driver_id);
-      }
-      res.json({ success: true, doc_type: type, status, missing: REQUIRED_DOCS.filter((t) => !have.has(t)) });
+      res.json({ success: true, doc_type: type, status: d.status, missing: REQUIRED_DOCS.filter((t) => !have.has(t)) });
     } catch (e) {
       console.log('upload exception', e.message);
       res.status(500).json({ error: 'Upload failed. Try again.' });
+    }
+  });
+
+  // ----- driver: submit all documents for review (needs the 4 required documents) -----
+  app.post('/driver/submit', needDb, requireDriver, async (req, res) => {
+    try {
+      const d = req.driver;
+      if (!['DOCS_PENDING', 'REJECTED'].includes(d.status)) return res.status(409).json({ error: 'Your documents are already submitted.' });
+      const { data: docs } = await supabase.from('driver_documents').select('doc_type').eq('driver_id', d.driver_id);
+      const have = new Set((docs || []).map((x) => x.doc_type));
+      const missing = REQUIRED_DOCS.filter((t) => !have.has(t));
+      if (missing.length) return res.status(400).json({ error: 'Upload all required documents first. Missing: ' + missing.join(', ') });
+      await supabase.from('drivers').update({ status: 'UNDER_REVIEW', rejection_reason: null, updated_at: nowIso() }).eq('driver_id', d.driver_id);
+      console.log(`📨 Driver submitted for review ${d.driver_id}`);
+      res.json({ success: true, status: 'UNDER_REVIEW' });
+    } catch (e) {
+      console.log('submit exception', e.message);
+      res.status(500).json({ error: 'Could not submit. Try again.' });
     }
   });
 
