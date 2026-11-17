@@ -13,6 +13,18 @@ const io = new Server(server, { cors: { origin: "*" } });
 const driverReg = require('./driver_registration');
 driverReg(app, io);
 
+// customer accounts (phone + PIN login)
+const crypto = require('crypto');
+const customerAcc = require('./customer_accounts');
+customerAcc(app);
+
+// the one-time trip PIN must never be sent to drivers: strip it from every ride that is broadcast or listed
+const publicRide = (ride) => {
+  if (!ride) return ride;
+  const { customer_pin, ...rest } = ride;
+  return rest;
+};
+
 const redis = new Redis(process.env.REDIS_URL || undefined, process.env.REDIS_URL ? { tls: {} } : {});
 redis.on('connect', () => console.log('✅ Redis connected'));
 redis.on('error', (err) => console.log('Redis error:', err.message));
@@ -126,8 +138,6 @@ app.post('/driver/location', async (req, res) => {
   if (process.env.REQUIRE_VERIFIED_DRIVERS === 'true' && !(await driverReg.isVerifiedRequest(req))) {
     return res.status(403).json({ error: 'Driver not verified' });
   }
-
-
   await redis.hset(`driver:${driver_id}:location`, { lat, lng, updated_at: Date.now() });
   global.onlineDrivers[driver_id] = { driver_id, lat, lng, last_seen: Date.now(), online: true };
   res.json({ success: true });
@@ -155,14 +165,18 @@ io.on('connection', (socket) => {
 });
 
 app.post('/rides/request', async (req, res) => {
-  const { tenant_id, customer_id, customer_phone, customer_pin, from, to, distance_km, fare,
-          vehicle_type, eta_min, booked_for_other, passenger_name, passenger_phone } = req.body;
+  const cust = await customerAcc.customerFromReq(req);
+  if (!cust) return res.status(401).json({ error: 'Please log in again' });
+  const { tenant_id, from, to, distance_km, fare, vehicle_type, eta_min, booked_for_other, passenger_name, passenger_phone } = req.body;
+  if (!from || !to) return res.status(400).json({ error: 'Pickup and drop are required' });
   const ride_id = `RIDE_${Date.now()}`;
+  const customer_pin = String(crypto.randomInt(1000, 10000)); // one-time trip PIN, only the requesting customer sees it
   const ride = {
     ride_id,
     tenant_id: tenant_id || 'TENANT_01',
-    customer_id: customer_id || customer_phone,
-    customer_phone,
+    customer_id: cust.customer_id,
+    customer_phone: cust.phone,
+    customer_name: cust.name,
     customer_pin,
     from, to, distance_km, fare,
     vehicle_type: vehicle_type || 'TAXI',
@@ -176,8 +190,8 @@ app.post('/rides/request', async (req, res) => {
   };
   rides.set(ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride_id, JSON.stringify(ride));
-  console.log(`🚕 Ride ${ride_id} Phone ${customer_phone} PIN ${customer_pin} Fare ₹${fare}`);
-  io.emit('ride:request', ride);
+  console.log(`🚕 Ride ${ride_id} customer ${cust.customer_id} Fare ₹${fare}`);
+  io.emit('ride:request', publicRide(ride));
   res.json({ success: true, ride });
 });
 
@@ -199,15 +213,15 @@ app.post('/rides/:id/accept', async (req, res) => {
   ride.accepted_at = new Date().toISOString();
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
-  io.emit('ride:accepted', ride);
-  res.json({ success: true, ride });
+  io.emit('ride:accepted', publicRide(ride));
+  res.json({ success: true, ride: publicRide(ride) });
 });
 
 app.post('/rides/:id/decline', async (req, res) => {
   const ride = await getRide(req.params.id);
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   ride.status = 'DECLINED';
-  io.emit('ride:declined', ride);
+  io.emit('ride:declined', publicRide(ride));
   res.json({ success: true });
 });
 
@@ -222,8 +236,8 @@ app.post('/rides/:id/cancel', async (req, res) => {
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
   console.log(`❌ Ride ${ride.ride_id} cancelled by ${ride.cancelled_by}: ${ride.cancel_reason}`);
-  io.emit('ride:cancelled', ride);
-  res.json({ success: true, ride });
+  io.emit('ride:cancelled', publicRide(ride));
+  res.json({ success: true, ride: publicRide(ride) });
 });
 
 app.post('/rides/:id/arrived', async (req, res) => {
@@ -233,8 +247,8 @@ app.post('/rides/:id/arrived', async (req, res) => {
   ride.arrived_at = new Date().toISOString();
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
-  io.emit('ride:arrived', ride);
-  res.json({ success: true, ride });
+  io.emit('ride:arrived', publicRide(ride));
+  res.json({ success: true, ride: publicRide(ride) });
 });
 
 app.post('/rides/:id/start', async (req, res) => {
@@ -242,15 +256,15 @@ app.post('/rides/:id/start', async (req, res) => {
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   // Optional PIN verification
   const { pin } = req.body;
-  if (pin && ride.customer_pin && pin != ride.customer_pin) {
-    return res.status(400).json({ error: `Wrong PIN. Expected ${ride.customer_pin}` });
+  if (!pin || String(pin) !== String(ride.customer_pin)) {
+    return res.status(400).json({ error: 'Wrong PIN. Ask the customer for their 4 digit trip PIN.' });
   }
   ride.status = 'STARTED';
   ride.started_at = new Date().toISOString();
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
-  io.emit('ride:started', ride);
-  res.json({ success: true, ride });
+  io.emit('ride:started', publicRide(ride));
+  res.json({ success: true, ride: publicRide(ride) });
 });
 
 app.post('/rides/:id/complete', async (req, res) => {
@@ -260,8 +274,8 @@ app.post('/rides/:id/complete', async (req, res) => {
   ride.completed_at = new Date().toISOString();
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
-  io.emit('ride:completed', ride);
-  res.json({ success: true, ride });
+  io.emit('ride:completed', publicRide(ride));
+  res.json({ success: true, ride: publicRide(ride) });
 });
 
 app.get('/rides/:id', async (req, res) => {
@@ -273,7 +287,9 @@ app.get('/rides/:id', async (req, res) => {
     } catch(e) {}
   }
   if (!ride) return res.status(404).json({error: 'Not found'});
-  res.json(ride);
+  const cust = await customerAcc.customerFromReq(req);
+  if (cust && cust.customer_id === ride.customer_id) return res.json(ride);
+  res.json(publicRide(ride));
 });
 
 app.get('/rides', async (req, res) => {
@@ -284,9 +300,9 @@ app.get('/rides', async (req, res) => {
     const merged = new Map();
     redisRides.forEach(r => merged.set(r.ride_id, r));
     memRides.forEach(r => merged.set(r.ride_id, r));
-    res.json(Array.from(merged.values()));
+    res.json(Array.from(merged.values()).map(publicRide));
   } catch(e) {
-    res.json(Array.from(rides.values()));
+    res.json(Array.from(rides.values()).map(publicRide));
   }
 });
 
