@@ -135,8 +135,9 @@ app.post('/driver/:id/selfie', async (req, res) => {
 app.post('/driver/location', async (req, res) => {
   const { driver_id, lat, lng } = req.body;
   if (!driver_id || !lat || !lng) return res.status(400).json({ error: "Missing" });
-  if (process.env.REQUIRE_VERIFIED_DRIVERS === 'true' && !(await driverReg.isVerifiedRequest(req))) {
-    return res.status(403).json({ error: 'Driver not verified' });
+  if (process.env.REQUIRE_VERIFIED_DRIVERS === 'true') {
+    const chk = await driverReg.onlineCheck(req);
+    if (!chk.ok) return res.status(403).json({ error: chk.error, issues: chk.issues || [] });
   }
   await redis.hset(`driver:${driver_id}:location`, { lat, lng, updated_at: Date.now() });
   global.onlineDrivers[driver_id] = { driver_id, lat, lng, last_seen: Date.now(), online: true };

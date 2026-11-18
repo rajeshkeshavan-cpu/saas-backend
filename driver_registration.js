@@ -8,8 +8,16 @@ const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
 
 const BUCKET = 'driver-docs';
-const REQUIRED_DOCS = ['SELFIE', 'DL', 'AADHAAR', 'RC'];
-const ALL_DOCS = [...REQUIRED_DOCS, 'POLICE']; // police verification is optional
+const REQUIRED_BASE = ['SELFIE', 'DL', 'AADHAAR', 'RC', 'PERMIT', 'INSURANCE'];
+const ALL_DOCS = [...REQUIRED_BASE, 'POLICE', 'FITNESS'];
+const DOC_NAMES = {
+  SELFIE: 'Selfie', DL: 'Driving licence', AADHAAR: 'Aadhaar', RC: 'RC book', PERMIT: 'Vehicle permit',
+  INSURANCE: 'Insurance', POLICE: 'Police verification', FITNESS: 'Fitness certificate',
+};
+// Police verification: required for taxis. For autos it is off until you confirm the state rule;
+// set POLICE_REQUIRED_AUTO=true in Render to require it for autos too.
+const policeRequired = (vehicleType) => vehicleType === 'TAXI' || process.env.POLICE_REQUIRED_AUTO === 'true';
+const requiredDocsFor = (driver) => (policeRequired(driver.vehicle_type) ? [...REQUIRED_BASE, 'POLICE'] : REQUIRED_BASE);
 const EXT = { 'image/jpeg': 'jpg', 'image/png': 'png', 'application/pdf': 'pdf' };
 
 const supabase =
@@ -51,6 +59,54 @@ async function getDriver(driver_id) {
   const { data } = await supabase.from('drivers').select('*').eq('driver_id', driver_id).maybeSingle();
   return data || null;
 }
+
+// ---------- compliance: documents + expiry dates + police rule ----------
+const DATE_RULES = [ // [column, label, required?]
+  ['dl_expiry', 'Driving licence', true],
+  ['permit_expiry', 'Vehicle permit', true],
+  ['insurance_expiry', 'Insurance', true],
+  ['fitness_expiry', 'Fitness certificate', false],
+];
+const todayIst = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD
+const daysUntil = (dateStr) => Math.round((new Date(dateStr + 'T00:00:00Z') - new Date(todayIst() + 'T00:00:00Z')) / 86400000);
+
+async function getCompliance(driver_id) {
+  const { data } = await supabase.from('driver_compliance').select('*').eq('driver_id', driver_id).maybeSingle();
+  return data || null;
+}
+
+// issues block the driver from going online; warnings are shown (expiring within 30 days)
+function evaluate(driver, comp, haveDocs, opts = {}) {
+  const issues = [];
+  const warnings = [];
+  if (!opts.skipStatus && driver.status !== 'VERIFIED') issues.push('Your account is not verified yet');
+  for (const t of requiredDocsFor(driver)) if (!haveDocs.has(t)) issues.push('Missing document: ' + DOC_NAMES[t]);
+  if (policeRequired(driver.vehicle_type) && !driver.police_verified) issues.push('Police verification is not confirmed yet');
+  if (!comp) {
+    issues.push('Licence, permit and insurance details are not entered yet');
+  } else {
+    for (const [col, label, req] of DATE_RULES) {
+      const v = comp[col];
+      if (!v) {
+        if (req) issues.push(label + ' expiry date is missing');
+        continue;
+      }
+      const left = daysUntil(v);
+      if (left < 0) issues.push(label + ' expired on ' + v);
+      else if (left <= 30) warnings.push(label + ' expires in ' + left + ' day' + (left === 1 ? '' : 's') + ' (' + v + ')');
+    }
+  }
+  return { ok: issues.length === 0, issues, warnings };
+}
+
+async function driverCompliance(driver, opts = {}) {
+  const { data: docs } = await supabase.from('driver_documents').select('doc_type').eq('driver_id', driver.driver_id);
+  const have = new Set((docs || []).map((x) => x.doc_type));
+  return evaluate(driver, await getCompliance(driver.driver_id), have, opts);
+}
+
+// the driver app asks for this about every 4 seconds, so remember the answer for a minute
+const onlineCache = new Map();
 
 function tokenOf(req) {
   const h = req.headers.authorization || '';
@@ -154,7 +210,9 @@ function mount(app, io) {
 
   app.get('/driver/me', needDb, requireDriver, async (req, res) => {
     const { data: docs } = await supabase.from('driver_documents').select('doc_type,status,uploaded_at').eq('driver_id', req.driver.driver_id);
-    res.json({ driver: publicDriver(req.driver), documents: docs || [], required: REQUIRED_DOCS, optional: ['POLICE'] });
+    const compliance = await driverCompliance(req.driver);
+    const required = requiredDocsFor(req.driver);
+    res.json({ driver: publicDriver(req.driver), documents: docs || [], required, optional: ALL_DOCS.filter((t) => !required.includes(t)), compliance });
   });
 
   // ----- driver: upload one document (multipart field "file") -----
@@ -184,7 +242,7 @@ function mount(app, io) {
 
       const { data: docs } = await supabase.from('driver_documents').select('doc_type').eq('driver_id', d.driver_id);
       const have = new Set((docs || []).map((x) => x.doc_type));
-      res.json({ success: true, doc_type: type, status: d.status, missing: REQUIRED_DOCS.filter((t) => !have.has(t)) });
+      res.json({ success: true, doc_type: type, status: d.status, missing: requiredDocsFor(d).filter((t) => !have.has(t)) });
     } catch (e) {
       console.log('upload exception', e.message);
       res.status(500).json({ error: 'Upload failed. Try again.' });
@@ -198,8 +256,8 @@ function mount(app, io) {
       if (!['DOCS_PENDING', 'REJECTED'].includes(d.status)) return res.status(409).json({ error: 'Your documents are already submitted.' });
       const { data: docs } = await supabase.from('driver_documents').select('doc_type').eq('driver_id', d.driver_id);
       const have = new Set((docs || []).map((x) => x.doc_type));
-      const missing = REQUIRED_DOCS.filter((t) => !have.has(t));
-      if (missing.length) return res.status(400).json({ error: 'Upload all required documents first. Missing: ' + missing.join(', ') });
+      const missing = requiredDocsFor(d).filter((t) => !have.has(t));
+      if (missing.length) return res.status(400).json({ error: 'Upload all required documents first. Missing: ' + missing.map((t) => DOC_NAMES[t]).join(', ') });
       await supabase.from('drivers').update({ status: 'UNDER_REVIEW', rejection_reason: null, updated_at: nowIso() }).eq('driver_id', d.driver_id);
       console.log(`📨 Driver submitted for review ${d.driver_id}`);
       res.json({ success: true, status: 'UNDER_REVIEW' });
@@ -233,7 +291,16 @@ function mount(app, io) {
       const { data: s } = await supabase.storage.from(BUCKET).createSignedUrl(doc.storage_path, 600); // link works 10 minutes
       out.push({ doc_type: doc.doc_type, status: doc.status, uploaded_at: doc.uploaded_at, url: s ? s.signedUrl : null, is_pdf: doc.storage_path.endsWith('.pdf') });
     }
-    res.json({ driver: publicDriver(d), documents: out, required: REQUIRED_DOCS });
+    const comp = await getCompliance(d.driver_id);
+    const have = new Set(out.map((x) => x.doc_type));
+    res.json({
+      driver: publicDriver(d),
+      documents: out,
+      required: requiredDocsFor(d),
+      police_required: policeRequired(d.vehicle_type),
+      compliance_details: comp,
+      compliance: evaluate(d, comp, have, { skipStatus: true }),
+    });
   });
 
   app.post('/admin/api/drivers/:id/approve', adminGuard, async (req, res) => {
@@ -241,11 +308,14 @@ function mount(app, io) {
     if (!d) return res.status(404).json({ error: 'Driver not found' });
     const { data: docs } = await supabase.from('driver_documents').select('doc_type').eq('driver_id', d.driver_id);
     const have = new Set((docs || []).map((x) => x.doc_type));
-    const missing = REQUIRED_DOCS.filter((t) => !have.has(t));
-    if (missing.length) return res.status(400).json({ error: 'Missing documents: ' + missing.join(', ') });
+    const missing = requiredDocsFor(d).filter((t) => !have.has(t));
+    if (missing.length) return res.status(400).json({ error: 'Missing documents: ' + missing.map((t) => DOC_NAMES[t]).join(', ') });
+    const check = evaluate(d, await getCompliance(d.driver_id), have, { skipStatus: true });
+    if (!check.ok) return res.status(400).json({ error: 'Cannot approve yet: ' + check.issues.join('; ') });
     const t = nowIso();
     await supabase.from('drivers').update({ status: 'VERIFIED', verified_at: t, rejection_reason: null, updated_at: t }).eq('driver_id', d.driver_id);
     await supabase.from('driver_documents').update({ status: 'APPROVED' }).eq('driver_id', d.driver_id);
+    onlineCache.delete(d.driver_id);
     console.log(`✅ Driver verified ${d.driver_id}`);
     io.emit('driver:status', { driver_id: d.driver_id, status: 'VERIFIED' });
     res.json({ success: true });
@@ -262,15 +332,82 @@ function mount(app, io) {
     res.json({ success: true });
   });
 
+  // admin enters the details read from the documents (licence, permit, insurance, fitness)
+  app.post('/admin/api/drivers/:id/compliance', adminGuard, async (req, res) => {
+    const d = await getDriver(req.params.id);
+    if (!d) return res.status(404).json({ error: 'Driver not found' });
+    const b = req.body || {};
+    const text = (v) => (v == null || String(v).trim() === '' ? null : String(v).trim().slice(0, 40));
+    const date = (v) => (v == null || String(v).trim() === '' ? null : /^\d{4}-\d{2}-\d{2}$/.test(String(v)) ? String(v) : 'BAD');
+    const row = {
+      driver_id: d.driver_id,
+      plate_type: ['YELLOW', 'GREEN', 'OTHER'].includes(b.plate_type) ? b.plate_type : null,
+      dl_number: text(b.dl_number),
+      badge_number: text(b.badge_number),
+      permit_number: text(b.permit_number),
+      dl_expiry: date(b.dl_expiry),
+      permit_expiry: date(b.permit_expiry),
+      insurance_expiry: date(b.insurance_expiry),
+      fitness_expiry: date(b.fitness_expiry),
+      updated_at: nowIso(),
+    };
+    if (['dl_expiry', 'permit_expiry', 'insurance_expiry', 'fitness_expiry'].some((k) => row[k] === 'BAD')) return res.status(400).json({ error: 'Dates must look like 2027-03-31' });
+    const { error } = await supabase.from('driver_compliance').upsert(row, { onConflict: 'driver_id' });
+    if (error) {
+      console.log('compliance save error', error.message);
+      return res.status(500).json({ error: 'Could not save: ' + error.message });
+    }
+    onlineCache.delete(d.driver_id);
+    res.json({ success: true, compliance: await driverCompliance(d, { skipStatus: true }) });
+  });
+
+  // drivers with a licence / permit / insurance / fitness date that has passed or is close
+  app.get('/admin/api/compliance/expiring', adminGuard, async (req, res) => {
+    const days = Math.min(Math.max(parseInt(req.query.days, 10) || 30, 1), 365);
+    const limit = new Date(Date.now() + days * 86400000).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const cols = DATE_RULES.map((r) => r[0]);
+    const { data, error } = await supabase.from('driver_compliance').select('*').or(cols.map((c) => c + '.lte.' + limit).join(','));
+    if (error) return res.status(500).json({ error: error.message });
+    const ids = (data || []).map((r) => r.driver_id);
+    const { data: drivers } = ids.length ? await supabase.from('drivers').select('driver_id,name,phone,vehicle_type,vehicle_number,status').in('driver_id', ids) : { data: [] };
+    const byId = Object.fromEntries((drivers || []).map((x) => [x.driver_id, x]));
+    const out = [];
+    for (const r of data || []) {
+      const items = DATE_RULES.filter(([c]) => r[c] && r[c] <= limit).map(([c, label]) => ({ label, date: r[c], days_left: daysUntil(r[c]) }));
+      if (items.length) out.push({ driver: byId[r.driver_id] || { driver_id: r.driver_id }, items });
+    }
+    out.sort((a, b) => Math.min(...a.items.map((i) => i.days_left)) - Math.min(...b.items.map((i) => i.days_left)));
+    res.json(out);
+  });
+
   app.post('/admin/api/drivers/:id/police', adminGuard, async (req, res) => {
     const value = (req.body || {}).value === true;
     await supabase.from('drivers').update({ police_verified: value, updated_at: nowIso() }).eq('driver_id', req.params.id);
+    onlineCache.delete(req.params.id);
     res.json({ success: true, police_verified: value });
   });
 }
 
 module.exports = mount;
 module.exports.lookupDriver = async (driver_id) => (supabase ? getDriver(driver_id) : null);
+// Used when a driver sends location: logged in, own driver_id, verified, documents and dates in order.
+module.exports.onlineCheck = async (req) => {
+  if (!supabase) return { ok: false, error: 'Server is not ready' };
+  const t = tokenOf(req);
+  if (!t) return { ok: false, error: 'Please log in again' };
+  const hit = onlineCache.get(t.driver_id);
+  let result = hit && Date.now() - hit.at < 60000 ? hit.result : null;
+  if (!result) {
+    const d = await getDriver(t.driver_id);
+    if (!d) return { ok: false, error: 'Account not found' };
+    const c = await driverCompliance(d);
+    result = { ok: c.ok, error: c.ok ? null : c.issues[0], issues: c.issues };
+    onlineCache.set(t.driver_id, { at: Date.now(), result });
+  }
+  if (String((req.body || {}).driver_id) !== t.driver_id) return { ok: false, error: 'Wrong driver account' };
+  return result;
+};
+
 // true only for a logged-in, VERIFIED driver sending their own driver_id
 module.exports.isVerifiedRequest = async (req) => {
   if (!supabase) return false;
