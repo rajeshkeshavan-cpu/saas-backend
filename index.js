@@ -2,36 +2,43 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
+const crypto = require('crypto');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+
+// Redis
+const redis = new Redis(process.env.REDIS_URL || undefined, process.env.REDIS_URL ? { tls: {} } : {});
+redis.on('connect', () => console.log('✅ Redis connected'));
+redis.on('error', (err) => console.log('Redis error:', err.message));
+
+// In-memory rides + driver presence
+const rides = new Map();
+global.onlineDrivers = {};
 
 // driver registration, document upload and admin verification
 const driverReg = require('./driver_registration');
 driverReg(app, io);
 
 // customer accounts (phone + PIN login)
-const crypto = require('crypto');
 const customerAcc = require('./customer_accounts');
 customerAcc(app);
 
-// the one-time trip PIN must never be sent to drivers: strip it from every ride that is broadcast or listed
+// Karnataka fares: route, breakdown, locked quote - surge capped at 1.0 per Rule 129
+const pricing = require('./pricing');
+pricing(app, { redis, customerAcc, rides: () => Array.from(rides.values()) });
+
+// the one-time trip PIN must never be sent to drivers
 const publicRide = (ride) => {
   if (!ride) return ride;
   const { customer_pin, ...rest } = ride;
   return rest;
 };
 
-const redis = new Redis(process.env.REDIS_URL || undefined, process.env.REDIS_URL ? { tls: {} } : {});
-redis.on('connect', () => console.log('✅ Redis connected'));
-redis.on('error', (err) => console.log('Redis error:', err.message));
-
-const rides = new Map();
-
-// Render restarts / sleep wipe the in-memory Map, so fall back to Redis
+// Render restarts wipe in-memory Map, fallback to Redis
 async function getRide(id) {
   let ride = rides.get(id);
   if (ride) return ride;
@@ -45,10 +52,9 @@ async function getRide(id) {
   } catch (e) {}
   return null;
 }
-global.onlineDrivers = {};
 
 app.get('/', (req, res) => {
-  res.send('SaaS Driver Backend - Phase 3 - Running');
+  res.send('SaaS Driver Backend - Karnataka Fares - Running');
 });
 
 app.get('/nearest', async (req, res) => {
@@ -77,7 +83,6 @@ app.get('/nearest', async (req, res) => {
   }
 });
 
-// NEW: Drivers list for customer app - MUST BE BEFORE listen!
 app.get('/drivers', async (req, res) => {
   try {
     const driverKeys = await redis.keys('driver:*:location');
@@ -95,7 +100,6 @@ app.get('/drivers', async (req, res) => {
         });
       }
     }
-    // Merge with in-memory
     for (let id in global.onlineDrivers) {
       if (!drivers.find(d => d.driver_id === id)) {
         drivers.push(global.onlineDrivers[id]);
@@ -108,7 +112,6 @@ app.get('/drivers', async (req, res) => {
   }
 });
 
-// NEW: Customer registration with PIN
 app.post('/customer/register', async (req, res) => {
   try {
     let { phone } = req.body;
@@ -126,7 +129,6 @@ app.post('/customer/register', async (req, res) => {
   }
 });
 
-// NEW: Driver selfie upload (mock verification)
 app.post('/driver/:id/selfie', async (req, res) => {
   console.log(`📸 Selfie received for ${req.params.id}`);
   res.json({ verified: true, driver_id: req.params.id });
@@ -152,7 +154,6 @@ io.on('connection', (socket) => {
       if (!driver_id || !lat || !lng) return;
       await redis.hset(`driver:${driver_id}:location`, { lat, lng, updated_at: Date.now() });
       global.onlineDrivers[driver_id] = { driver_id, lat, lng, last_seen: Date.now(), online: true };
-      console.log(`📍 ${driver_id} ${lat},${lng}`);
       const key = `tenant:${tenant_id || 'TENANT_01'}:drivers:geo`;
       await redis.geoadd(key, lng, lat, driver_id);
       io.emit('driver:location', { driver_id, lat, lng });
@@ -165,13 +166,35 @@ io.on('connection', (socket) => {
   });
 });
 
+// ---------- RIDES ----------
 app.post('/rides/request', async (req, res) => {
   const cust = await customerAcc.customerFromReq(req);
   if (!cust) return res.status(401).json({ error: 'Please log in again' });
-  const { tenant_id, from, to, distance_km, fare, vehicle_type, eta_min, booked_for_other, passenger_name, passenger_phone } = req.body;
+  const { tenant_id, from, to, distance_km: client_distance, fare: client_fare, vehicle_type, eta_min, booked_for_other, passenger_name, passenger_phone, quote_id } = req.body;
   if (!from || !to) return res.status(400).json({ error: 'Pickup and drop are required' });
+
+  // Karnataka compliant: server is authority for fare
+  let fareData = null;
+  let locked = null;
+  if (quote_id) {
+    locked = await pricing.takeQuote(redis, quote_id, cust.customer_id);
+    if (locked) {
+      fareData = { total: locked.total, breakdown: locked.breakdown, distance_km: locked.distance_km, duration_min: locked.duration_min };
+      console.log(`🔒 Using locked quote ${quote_id} fare ₹${locked.total} for ${cust.customer_id}`);
+    }
+  }
+  // If no locked quote, client sent distance - fallback (less accurate, but prevents app break)
+  if (!fareData) {
+    if (client_distance && client_fare) {
+      console.log(`⚠️ No locked quote, using client values distance ${client_distance} fare ${client_fare} - encourage app to use /fare/quote`);
+      fareData = { total: Number(client_fare), breakdown: null, distance_km: Number(client_distance) };
+    } else {
+      return res.status(400).json({ error: 'Please get fare quote first: POST /fare/quote with from/to' });
+    }
+  }
+
   const ride_id = `RIDE_${Date.now()}`;
-  const customer_pin = String(crypto.randomInt(1000, 10000)); // one-time trip PIN, only the requesting customer sees it
+  const customer_pin = String(crypto.randomInt(1000, 10000));
   const ride = {
     ride_id,
     tenant_id: tenant_id || 'TENANT_01',
@@ -179,8 +202,12 @@ app.post('/rides/request', async (req, res) => {
     customer_phone: cust.phone,
     customer_name: cust.name,
     customer_pin,
-    from, to, distance_km, fare,
-    vehicle_type: vehicle_type || 'TAXI',
+    from, to,
+    distance_km: fareData.distance_km,
+    duration_min: fareData.duration_min || null,
+    fare: fareData.total,
+    fare_breakdown: fareData.breakdown,
+    vehicle_type: locked?.vehicle_type || vehicle_type || 'TAXI',
     eta_min: eta_min || null,
     booked_for_other: booked_for_other === true,
     passenger_name: passenger_name || null,
@@ -191,7 +218,7 @@ app.post('/rides/request', async (req, res) => {
   };
   rides.set(ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride_id, JSON.stringify(ride));
-  console.log(`🚕 Ride ${ride_id} customer ${cust.customer_id} Fare ₹${fare}`);
+  console.log(`🚕 Ride ${ride_id} customer ${cust.customer_id} Fare ₹${fareData.total} ${locked ? '(locked)' : '(client fallback)'}`);
   io.emit('ride:request', publicRide(ride));
   res.json({ success: true, ride });
 });
@@ -255,7 +282,6 @@ app.post('/rides/:id/arrived', async (req, res) => {
 app.post('/rides/:id/start', async (req, res) => {
   const ride = await getRide(req.params.id);
   if (!ride) return res.status(404).json({error: 'Ride not found'});
-  // Optional PIN verification
   const { pin } = req.body;
   if (!pin || String(pin) !== String(ride.customer_pin)) {
     return res.status(400).json({ error: 'Wrong PIN. Ask the customer for their 4 digit trip PIN.' });
@@ -308,4 +334,4 @@ app.get('/rides', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Phase 3 - Drivers + PIN running on PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Karnataka Fares - Running on PORT ${PORT}`));
