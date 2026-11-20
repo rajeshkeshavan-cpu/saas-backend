@@ -209,10 +209,27 @@ function mount(app, io) {
   });
 
   app.get('/driver/me', needDb, requireDriver, async (req, res) => {
-    const { data: docs } = await supabase.from('driver_documents').select('doc_type,status,uploaded_at').eq('driver_id', req.driver.driver_id);
+    const { data: docs } = await supabase.from('driver_documents').select('doc_type,status,uploaded_at,storage_path').eq('driver_id', req.driver.driver_id);
     const compliance = await driverCompliance(req.driver);
     const required = requiredDocsFor(req.driver);
     res.json({ driver: publicDriver(req.driver), documents: docs || [], required, optional: ALL_DOCS.filter((t) => !required.includes(t)), compliance });
+  });
+
+  // Signed URL to view document from private Supabase bucket driver-docs
+  app.get('/driver/docs/:type/url', needDb, requireDriver, async (req, res) => {
+    try {
+      const type = String(req.params.type).toUpperCase();
+      if (!ALL_DOCS.includes(type)) return res.status(400).json({ error: 'Unknown doc type' });
+      const { data: doc } = await supabase.from('driver_documents').select('storage_path').eq('driver_id', req.driver.driver_id).eq('doc_type', type).maybeSingle();
+      if (!doc || !doc.storage_path) return res.status(404).json({ error: 'Document not found in driver_documents table' });
+      // Create signed URL valid 5 minutes
+      const { data: signed, error } = await supabase.storage.from(BUCKET).createSignedUrl(doc.storage_path, 300);
+      if (error || !signed) return res.status(500).json({ error: 'Could not create signed URL: ' + (error?.message || 'unknown') });
+      res.json({ url: signed.signedUrl, doc_type: type, storage_path: doc.storage_path });
+    } catch (e) {
+      console.log('signed url error', e.message);
+      res.status(500).json({ error: e.message });
+    }
   });
 
   // ----- driver: upload one document (multipart field "file") -----
