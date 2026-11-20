@@ -31,6 +31,16 @@ customerAcc(app);
 const pricing = require('./pricing');
 pricing(app, { redis, customerAcc, rides: () => Array.from(rides.values()) });
 
+// Karnataka Namma Yatri - Wallet + Subscription (Zero commission) - MERGED FINAL
+const walletSub = require('./wallet_subscription');
+walletSub(app, { 
+  redis, 
+  driverReg, 
+  io,
+  requireDriver: driverReg.requireDriver || ((req,res,next)=>next()),
+  invalidate: (id)=>{} 
+});
+
 // the one-time trip PIN must never be sent to drivers
 const publicRide = (ride) => {
   if (!ride) return ride;
@@ -228,6 +238,14 @@ app.post('/rides/:id/accept', async (req, res) => {
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   const { driver_id } = req.body;
   if (ride.status !== 'REQUESTED') return res.status(409).json({ error: 'Ride already taken or cancelled' });
+  // Karnataka subscription gate - Namma Yatri model
+  try {
+    // lookup driver for gate
+    let driverForGate = { driver_id, vehicle_type: ride.vehicle_type||'AUTO' };
+    try { const dr = await driverReg.lookupDriver(driver_id); if(dr) driverForGate = dr; } catch(e){}
+    const check = await walletSub.gate(driverForGate);
+    if (!check.ok) return res.status(403).json({ error: check.error, subscription_required: true, blocked: true });
+  } catch(e) { console.log('subscription gate error', e.message); }
   ride.status = 'ACCEPTED';
   ride.driver_id = driver_id;
   try {
@@ -302,6 +320,8 @@ app.post('/rides/:id/complete', async (req, res) => {
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
   io.emit('ride:completed', publicRide(ride));
+  // Karnataka wallet: credit full govt fare to driver (zero commission)
+  try { await walletSub.creditRide(ride); } catch(e) { console.log('wallet credit error', e.message); }
   res.json({ success: true, ride: publicRide(ride) });
 });
 
