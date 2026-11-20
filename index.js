@@ -41,6 +41,10 @@ walletSub(app, {
   invalidate: (id)=>{} 
 });
 
+// Phase 3: Razorpay UPI Direct + Subscription Autopay Rs25/35
+const razor = require('./razorpay');
+razor(app, { redis, driverReg, io });
+
 // the one-time trip PIN must never be sent to drivers
 const publicRide = (ride) => {
   if (!ride) return ride;
@@ -64,7 +68,7 @@ async function getRide(id) {
 }
 
 app.get('/', (req, res) => {
-  res.send('SaaS Driver Backend - Karnataka Fares - Running');
+  res.send('SaaS Driver Backend - Karnataka Fares - Running + Razorpay');
 });
 
 app.get('/nearest', async (req, res) => {
@@ -183,7 +187,6 @@ app.post('/rides/request', async (req, res) => {
   const { tenant_id, from, to, distance_km: client_distance, fare: client_fare, vehicle_type, eta_min, booked_for_other, passenger_name, passenger_phone, quote_id } = req.body;
   if (!from || !to) return res.status(400).json({ error: 'Pickup and drop are required' });
 
-  // Karnataka compliant: server is authority for fare
   let fareData = null;
   let locked = null;
   if (quote_id) {
@@ -193,10 +196,9 @@ app.post('/rides/request', async (req, res) => {
       console.log(`🔒 Using locked quote ${quote_id} fare ₹${locked.total} for ${cust.customer_id}`);
     }
   }
-  // If no locked quote, client sent distance - fallback (less accurate, but prevents app break)
   if (!fareData) {
     if (client_distance && client_fare) {
-      console.log(`⚠️ No locked quote, using client values distance ${client_distance} fare ${client_fare} - encourage app to use /fare/quote`);
+      console.log(`⚠ No locked quote, using client values distance ${client_distance} fare ${client_fare}`);
       fareData = { total: Number(client_fare), breakdown: null, distance_km: Number(client_distance) };
     } else {
       return res.status(400).json({ error: 'Please get fare quote first: POST /fare/quote with from/to' });
@@ -228,7 +230,7 @@ app.post('/rides/request', async (req, res) => {
   };
   rides.set(ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride_id, JSON.stringify(ride));
-  console.log(`🚕 Ride ${ride_id} customer ${cust.customer_id} Fare ₹${fareData.total} ${locked ? '(locked)' : '(client fallback)'}`);
+  console.log(`🚕 Ride ${ride_id} customer ${cust.customer_id} Fare ₹${fareData.total}`);
   io.emit('ride:request', publicRide(ride));
   res.json({ success: true, ride });
 });
@@ -238,9 +240,7 @@ app.post('/rides/:id/accept', async (req, res) => {
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   const { driver_id } = req.body;
   if (ride.status !== 'REQUESTED') return res.status(409).json({ error: 'Ride already taken or cancelled' });
-  // Karnataka subscription gate - Namma Yatri model
   try {
-    // lookup driver for gate
     let driverForGate = { driver_id, vehicle_type: ride.vehicle_type||'AUTO' };
     try { const dr = await driverReg.lookupDriver(driver_id); if(dr) driverForGate = dr; } catch(e){}
     const check = await walletSub.gate(driverForGate);
@@ -320,7 +320,6 @@ app.post('/rides/:id/complete', async (req, res) => {
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
   io.emit('ride:completed', publicRide(ride));
-  // Karnataka wallet: credit full govt fare to driver (zero commission)
   try { await walletSub.creditRide(ride); } catch(e) { console.log('wallet credit error', e.message); }
   res.json({ success: true, ride: publicRide(ride) });
 });
@@ -354,4 +353,4 @@ app.get('/rides', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Karnataka Fares - Running on PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Karnataka Fares - Running on PORT ${PORT} + Razorpay`));
