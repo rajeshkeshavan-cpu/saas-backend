@@ -70,7 +70,10 @@ function mount(app, ctx) {
   // --- Rider: Create payment order for ride (UPI direct - zero commission) ---
   app.post('/rider/payment/order', async (req, res) => {
     const rz = getRazor();
-    if (!rz) return res.status(500).json({ error: 'Razorpay not configured' });
+    if (!rz) {
+      console.log('❌ RAZORPAY KEYS MISSING - check Render env RAZORPAY_KEY_ID/SECRET');
+      return res.status(500).json({ error: 'Razorpay not configured - missing keys in Render env', configured: false });
+    }
     try {
       const { ride_id, amount, customer_phone, driver_id } = req.body;
       if (!amount || !ride_id) return res.status(400).json({ error: 'ride_id and amount required' });
@@ -88,8 +91,8 @@ function mount(app, ctx) {
       console.log(`💳 Razorpay order created for ride ${ride_id} ₹${amount} order_id ${order.id}`);
       res.json({ success: true, order_id: order.id, amount: amount, amount_paise: amtPaise, currency: 'INR', key_id: process.env.RAZORPAY_KEY_ID, ride_id });
     } catch (e) {
-      console.log('Razorpay order error', e.message);
-      res.status(500).json({ error: e.message });
+      console.log('Razorpay order error', e.message, e.stack);
+      res.status(500).json({ error: e.message, stack: e.stack });
     }
   });
 
@@ -211,10 +214,17 @@ function mount(app, ctx) {
     } catch(e){ console.log('Sub verify error', e.message); res.status(500).json({ error: e.message }); }
   });
 
-  // Webhook for auto-capture - simplified (no raw parser to avoid crash)
+  // Webhook for auto-capture (uses json body - raw would conflict with global express.json)
   app.post('/razorpay/webhook', async (req, res) => {
     try {
-      console.log('🔔 Razorpay webhook', req.body?.event || 'unknown');
+      const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET || '';
+      if (webhookSecret) {
+        const signature = req.headers['x-razorpay-signature'];
+        const expected = crypto.createHmac('sha256', webhookSecret).update(req.body).digest('hex');
+        if (signature !== expected) return res.status(400).json({ error: 'Invalid webhook signature' });
+      }
+      const payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+      console.log('🔔 Razorpay webhook', payload.event);
       res.json({ status: 'ok' });
     } catch(e){ res.status(400).json({ error: e.message }); }
   });

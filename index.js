@@ -31,20 +31,6 @@ customerAcc(app);
 const pricing = require('./pricing');
 pricing(app, { redis, customerAcc, rides: () => Array.from(rides.values()) });
 
-// Karnataka Namma Yatri - Wallet + Subscription (Zero commission) - MERGED FINAL
-const walletSub = require('./wallet_subscription');
-walletSub(app, { 
-  redis, 
-  driverReg, 
-  io,
-  requireDriver: driverReg.requireDriver || ((req,res,next)=>next()),
-  invalidate: (id)=>{} 
-});
-
-// Phase 3: Razorpay UPI Direct + Subscription Autopay Rs25/35
-const razor = require('./razorpay');
-razor(app, { redis, driverReg, io });
-
 // the one-time trip PIN must never be sent to drivers
 const publicRide = (ride) => {
   if (!ride) return ride;
@@ -68,7 +54,7 @@ async function getRide(id) {
 }
 
 app.get('/', (req, res) => {
-  res.send('SaaS Driver Backend - Karnataka Fares - Running + Razorpay');
+  res.send('SaaS Driver Backend - Karnataka Fares - Running');
 });
 
 app.get('/nearest', async (req, res) => {
@@ -187,6 +173,7 @@ app.post('/rides/request', async (req, res) => {
   const { tenant_id, from, to, distance_km: client_distance, fare: client_fare, vehicle_type, eta_min, booked_for_other, passenger_name, passenger_phone, quote_id } = req.body;
   if (!from || !to) return res.status(400).json({ error: 'Pickup and drop are required' });
 
+  // Karnataka compliant: server is authority for fare
   let fareData = null;
   let locked = null;
   if (quote_id) {
@@ -196,9 +183,10 @@ app.post('/rides/request', async (req, res) => {
       console.log(`🔒 Using locked quote ${quote_id} fare ₹${locked.total} for ${cust.customer_id}`);
     }
   }
+  // If no locked quote, client sent distance - fallback (less accurate, but prevents app break)
   if (!fareData) {
     if (client_distance && client_fare) {
-      console.log(`⚠ No locked quote, using client values distance ${client_distance} fare ${client_fare}`);
+      console.log(`⚠️ No locked quote, using client values distance ${client_distance} fare ${client_fare} - encourage app to use /fare/quote`);
       fareData = { total: Number(client_fare), breakdown: null, distance_km: Number(client_distance) };
     } else {
       return res.status(400).json({ error: 'Please get fare quote first: POST /fare/quote with from/to' });
@@ -230,7 +218,7 @@ app.post('/rides/request', async (req, res) => {
   };
   rides.set(ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride_id, JSON.stringify(ride));
-  console.log(`🚕 Ride ${ride_id} customer ${cust.customer_id} Fare ₹${fareData.total}`);
+  console.log(`🚕 Ride ${ride_id} customer ${cust.customer_id} Fare ₹${fareData.total} ${locked ? '(locked)' : '(client fallback)'}`);
   io.emit('ride:request', publicRide(ride));
   res.json({ success: true, ride });
 });
@@ -240,12 +228,6 @@ app.post('/rides/:id/accept', async (req, res) => {
   if (!ride) return res.status(404).json({error: 'Ride not found'});
   const { driver_id } = req.body;
   if (ride.status !== 'REQUESTED') return res.status(409).json({ error: 'Ride already taken or cancelled' });
-  try {
-    let driverForGate = { driver_id, vehicle_type: ride.vehicle_type||'AUTO' };
-    try { const dr = await driverReg.lookupDriver(driver_id); if(dr) driverForGate = dr; } catch(e){}
-    const check = await walletSub.gate(driverForGate);
-    if (!check.ok) return res.status(403).json({ error: check.error, subscription_required: true, blocked: true });
-  } catch(e) { console.log('subscription gate error', e.message); }
   ride.status = 'ACCEPTED';
   ride.driver_id = driver_id;
   try {
@@ -320,7 +302,6 @@ app.post('/rides/:id/complete', async (req, res) => {
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
   io.emit('ride:completed', publicRide(ride));
-  try { await walletSub.creditRide(ride); } catch(e) { console.log('wallet credit error', e.message); }
   res.json({ success: true, ride: publicRide(ride) });
 });
 
@@ -352,5 +333,36 @@ app.get('/rides', async (req, res) => {
   }
 });
 
+
+// ---- Razorpay + Wallet/Subscription (mount AFTER other routes, BEFORE PORT) ----
+try {
+  const { createClient } = require('@supabase/supabase-js');
+  const supa = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY)
+    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
+    : null;
+  global.supabase = supa;
+  const razor = require('./razorpay');
+  razor(app, { supabase: supa, redis, driverReg, io });
+  console.log('✅ Razorpay mounted: /rider/payment/order + /rider/payment/verify');
+
+  const walletSub = require('./wallet_subscription_merged');
+  if (typeof walletSub === 'function') {
+    walletSub(app, { supabase: supa, redis, driverReg, io });
+    console.log('✅ Wallet/Sub mounted');
+  } else if (walletSub && typeof walletSub.mount === 'function') {
+    walletSub.mount(app, { supabase: supa, redis, driverReg, io });
+    console.log('✅ Wallet/Sub mounted via .mount');
+  }
+} catch(e) {
+  console.log('Mount error', e.message, e.stack);
+}
+
+// Health check for razorpay keys
+app.get('/health/razorpay', (req,res)=>{
+  const hasKey = !!(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+  res.json({ configured: hasKey, key_id_present: !!process.env.RAZORPAY_KEY_ID, key_prefix: (process.env.RAZORPAY_KEY_ID||'').substring(0,8), mode: hasKey ? 'LIVE' : 'MISSING_KEYS' });
+});
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Karnataka Fares - Running on PORT ${PORT} + Razorpay`));
+
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Karnataka Fares - Running on PORT ${PORT}`));
