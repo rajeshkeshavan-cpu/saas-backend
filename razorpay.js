@@ -91,8 +91,9 @@ function mount(app, ctx) {
       console.log(`💳 Razorpay order created for ride ${ride_id} ₹${amount} order_id ${order.id}`);
       res.json({ success: true, order_id: order.id, amount: amount, amount_paise: amtPaise, currency: 'INR', key_id: process.env.RAZORPAY_KEY_ID, ride_id });
     } catch (e) {
-      console.log('Razorpay order error', e.message, e.stack);
-      res.status(500).json({ error: e.message, stack: e.stack });
+      console.log('Razorpay order error FULL', e, e.message, e.error, e.statusCode);
+      const detail = e.error ? e.error.description || e.error.reason || JSON.stringify(e.error) : e.message;
+      res.status(500).json({ error: detail, message: e.message, razorpay_error: e.error || null, statusCode: e.statusCode || 500 });
     }
   });
 
