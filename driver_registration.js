@@ -393,7 +393,7 @@ function mount(app, io) {
     const { data, error } = await supabase.from('driver_compliance').select('*').or(cols.map((c) => c + '.lte.' + limit).join(','));
     if (error) return res.status(500).json({ error: error.message });
     const ids = (data || []).map((r) => r.driver_id);
-    const { data: drivers } = ids.length ? await supabase.from('drivers').select('driver_id,name,phone,vehicle_type,vehicle_number,status').in('driver_id', ids) : { data: [] };
+    const { data: drivers } = ids.length ? await supabase.from('drivers').select('driver_id,name,phone,vehicle_type,vehicle_number,status,upi_id').in('driver_id', ids) : { data: [] };
     const byId = Object.fromEntries((drivers || []).map((x) => [x.driver_id, x]));
     const out = [];
     for (const r of data || []) {
