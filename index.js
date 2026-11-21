@@ -363,6 +363,52 @@ app.get('/health/razorpay', (req,res)=>{
   res.json({ configured: hasKey, key_id_present: !!process.env.RAZORPAY_KEY_ID, key_prefix: (process.env.RAZORPAY_KEY_ID||'').substring(0,8), mode: hasKey ? 'LIVE' : 'MISSING_KEYS' });
 });
 
+
+// Add to driver_registration.js or index.js - Driver UPI save
+app.post('/driver/upi', async (req, res) => {
+  try {
+    const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!token) return res.status(401).json({error: 'Login required'});
+    const { createClient } = require('@supabase/supabase-js');
+    const supa = global.supabase || (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {auth:{persistSession:false}}) : null);
+    if (!supa) return res.status(500).json({error: 'Supabase not configured'});
+    
+    // Verify driver token
+    const driverReg = require('./driver_registration');
+    let driver = null;
+    try { driver = await driverReg.verifyDriverToken(token); } catch(_){}
+    if (!driver) {
+      // fallback JWT
+      try { const jwt = require('jsonwebtoken'); driver = jwt.verify(token, process.env.JWT_SECRET || ''); } catch(_){}
+    }
+    if (!driver) return res.status(401).json({error: 'Invalid token'});
+    
+    const driver_id = driver.driver_id || driver.id;
+    const { upi_id } = req.body;
+    if (!upi_id || !upi_id.includes('@')) return res.status(400).json({error: 'Valid UPI ID required e.g. 9886180011@ybl'});
+    
+    const { data, error } = await supa.from('drivers').update({ upi_id: upi_id.trim(), updated_at: new Date().toISOString() }).eq('driver_id', driver_id).select().maybeSingle();
+    if (error) {
+      console.log('UPI save error', error.message);
+      return res.status(500).json({error: error.message});
+    }
+    console.log(`✅ Driver ${driver_id} UPI saved ${upi_id}`);
+    res.json({success: true, driver_id, upi_id: upi_id.trim()});
+  } catch(e) {
+    res.status(500).json({error: e.message});
+  }
+});
+
+app.get('/driver/upi/:id', async (req, res) => {
+  try {
+    const { createClient } = require('@supabase/supabase-js');
+    const supa = global.supabase || (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {auth:{persistSession:false}}) : null);
+    const { data } = await supa.from('drivers').select('driver_id, upi_id').eq('driver_id', req.params.id).maybeSingle();
+    res.json(data || {upi_id: null});
+  } catch(e) { res.json({upi_id: null}); }
+});
+
+
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Karnataka Fares - Running on PORT ${PORT}`));
