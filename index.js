@@ -3,6 +3,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
 const crypto = require('crypto');
+const fs = require('fs');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -14,6 +16,13 @@ const io = new Server(server, { cors: { origin: "*" } });
 const redis = new Redis(process.env.REDIS_URL || undefined, process.env.REDIS_URL ? { tls: {} } : {});
 redis.on('connect', () => console.log('✅ Redis connected'));
 redis.on('error', (err) => console.log('Redis error:', err.message));
+
+// Supabase global for UPI routes
+const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
+  : null;
+global.supabase = supabase;
+if (!supabase) console.log('⚠️ Supabase not configured');
 
 // In-memory rides + driver presence
 const rides = new Map();
@@ -30,6 +39,86 @@ customerAcc(app);
 // Karnataka fares: route, breakdown, locked quote - surge capped at 1.0 per Rule 129
 const pricing = require('./pricing');
 pricing(app, { redis, customerAcc, rides: () => Array.from(rides.values()) });
+
+// ---------- Landing Page for Razorpay Website Approval ----------
+const LANDING_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UrbanRide - Karnataka Govt Compliant Ride Booking</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:Inter,system-ui,sans-serif}
+body{background:#f8fafc;color:#1e293b;line-height:1.6}
+.hero{background:linear-gradient(135deg,#16a34a,#15803d);color:white;padding:60px 20px;text-align:center}
+.hero h1{font-size:42px;margin-bottom:12px}
+.hero p{font-size:18px;opacity:.9}
+.container{max-width:1000px;margin:0 auto;padding:40px 20px}
+.card{background:white;border-radius:16px;padding:28px;margin:20px 0;box-shadow:0 4px 20px rgba(0,0,0,.06);border:1px solid #e2e8f0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px}
+.badge{background:#dcfce7;color:#166534;padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;display:inline-block;margin:4px}
+h2{color:#15803d;margin-bottom:16px} h3{margin-bottom:8px} ul{padding-left:20px}
+.footer{background:#1e293b;color:#94a3b8;padding:30px 20px;text-align:center;margin-top:40px}
+a{color:#16a34a;text-decoration:none}
+.btn{background:#16a34a;color:white;padding:12px 24px;border-radius:8px;display:inline-block;margin:10px 10px 0 0;font-weight:600}
+</style>
+</head>
+<body>
+<div class="hero">
+<h1>🚕 UrbanRide</h1>
+<p>Karnataka Government Fare Compliant • Zero Commission for Drivers</p>
+<p style="margin-top:10px"><span class="badge">GOVT APPROVED FARES</span> <span class="badge">AUTO Rs36 + Rs18/km</span> <span class="badge">TAXI Rs100 + Rs24/km</span> <span class="badge">Razorpay Secured</span></p>
+</div>
+<div class="container">
+<div class="card">
+<h2>About UrbanRide</h2>
+<p>UrbanRide is a Karnataka-compliant ride booking platform for Auto and Taxi drivers. We follow <b>Karnataka Motor Vehicles Rules, Rule 129 - Fare Chart</b> with surge capped at 1.0x. Drivers receive 100% of ride fare directly to their bank via UPI QR - zero commission model.</p>
+<p style="margin-top:12px">Platform fee: Rs25 Auto / Rs35 Taxi per day for app usage. Payments powered by Razorpay.</p>
+<a href="#contact" class="btn">Driver App</a>
+<a href="#contact" class="btn" style="background:white;color:#16a34a;border:1px solid #16a34a">Customer App</a>
+</div>
+<div class="grid">
+<div class="card"><h3>🚖 For Drivers</h3><ul><li>100% fare direct to your bank via UPI</li><li>Daily subscription Rs25 Auto, Rs35 Taxi</li><li>Govt fare, no surge exploitation</li><li>RC, DL, Permit verification</li></ul></div>
+<div class="card"><h3>🧑‍💼 For Customers</h3><ul><li>Govt fixed fares - no hidden charges</li><li>UPI payment direct to driver</li><li>Trip PIN verification</li><li>Live tracking</li></ul></div>
+<div class="card"><h3>💳 Payments</h3><ul><li>Ride fare: UPI direct to driver bank</li><li>Platform fee: Razorpay UPI to UrbanRide</li><li>Secure, RBI compliant</li><li>Instant settlement</li></ul></div>
+</div>
+<div class="card" id="contact">
+<h2>Contact & Business Details</h2>
+<p><b>Business Name:</b> UrbanRide</p>
+<p><b>Business Type:</b> Individual - Transportation Service</p>
+<p><b>Website:</b> https://saas-backend-avz2.onrender.com</p>
+<p><b>Contact:</b> rajesh.keshavan@okaxis / 9886180011</p>
+<p><b>Address:</b> Bengaluru, Karnataka, India 560045</p>
+<p><b>Service Area:</b> Karnataka - Bengaluru Urban</p>
+<br><h3>Policies</h3><p><a href="/privacy">Privacy Policy</a> | <a href="/terms">Terms</a> | <a href="/refund">Refund & Cancellation</a> | <a href="/contact">Contact Us</a></p>
+</div>
+<div class="card">
+<h2>How It Works</h2>
+<p><b>1.</b> Customer books ride - fare per Karnataka govt chart<br>
+<b>2.</b> Driver accepts - arrives at pickup<br>
+<b>3.</b> Trip PIN verified - ride starts<br>
+<b>4.</b> Ride completes - customer scans driver's UPI QR - amount goes direct to driver's bank<br>
+<b>5.</b> Driver pays daily platform fee Rs25 via Razorpay UPI to UrbanRide</p>
+</div>
+</div>
+<div class="footer"><p>UrbanRide © 2026 - Karnataka Govt Fare Compliant</p><p>Backend API: /health, /fare/quote, /rides/* | Razorpay Integrated | Supabase Secured</p><p style="margin-top:10px"><a href="/privacy" style="color:#94a3b8">Privacy</a> | <a href="/terms" style="color:#94a3b8">Terms</a> | <a href="/health/razorpay" style="color:#94a3b8">Razorpay Status</a> | <a href="/health">Health</a></p></div>
+</body>
+</html>`;
+
+app.get('/', (req, res) => {
+  // Serve landing page for browser, JSON for API check
+  const accept = req.headers.accept || '';
+  if (accept.includes('text/html') || !accept.includes('application/json')) {
+    res.set('Content-Type','text/html').send(LANDING_HTML);
+  } else {
+    res.json({ status: 'UrbanRide Backend - Running', version: 'Karnataka Fares v2', razorpay: !!process.env.RAZORPAY_KEY_ID });
+  }
+});
+
+app.get('/privacy', (req,res)=>res.send('<h1>Privacy Policy - UrbanRide</h1><p>We collect phone, location, ride data for service. UPI IDs stored securely in Supabase. No data sold. Data retained per legal requirements. Contact: 9886180011</p><p>Last updated: Nov 2026</p><br><a href="/">Home</a>'));
+app.get('/terms', (req,res)=>res.send('<h1>Terms of Service - UrbanRide</h1><p>Drivers must have valid DL, RC, Permit, Insurance. Fares per Karnataka Govt notification. Platform fee Rs25/35 daily non-refundable unless service down >24h. Zero commission model - ride fare direct to driver.</p><br><a href="/">Home</a>'));
+app.get('/refund', (req,res)=>res.send('<h1>Refund & Cancellation Policy - UrbanRide</h1><p>Platform fee Rs25/35 daily: Refund if service not usable for >24h due to technical issue, processed via Razorpay within 5-7 days. Ride fare: Direct between customer and driver via UPI, not held by UrbanRide, so no refund via platform. Cancellation: Ride can be cancelled before driver arrival without charge.</p><p>Contact: 9886180011 / rajesh.keshavan@okaxis</p><br><a href="/">Home</a>'));
+app.get('/contact', (req,res)=>res.send('<h1>Contact Us - UrbanRide</h1><p><b>UrbanRide</b><br>Phone: 9886180011<br>Email: rajesh.keshavan@okaxis<br>Address: Baiyyappanahalli, Bengaluru, Karnataka 560045<br>Business: Individual - Transportation</p><br><a href="/">Home</a>'));
+app.get('/health', (req,res)=>res.json({ ok:true, time: new Date().toISOString(), redis: redis.status, supabase: !!supabase }));
 
 // the one-time trip PIN must never be sent to drivers
 const publicRide = (ride) => {
@@ -52,10 +141,6 @@ async function getRide(id) {
   } catch (e) {}
   return null;
 }
-
-app.get('/', (req, res) => {
-  res.send('SaaS Driver Backend - Karnataka Fares - Running');
-});
 
 app.get('/nearest', async (req, res) => {
   const { tenant_id, lat, lng, radius_km = 3 } = req.query;
@@ -173,7 +258,6 @@ app.post('/rides/request', async (req, res) => {
   const { tenant_id, from, to, distance_km: client_distance, fare: client_fare, vehicle_type, eta_min, booked_for_other, passenger_name, passenger_phone, quote_id } = req.body;
   if (!from || !to) return res.status(400).json({ error: 'Pickup and drop are required' });
 
-  // Karnataka compliant: server is authority for fare
   let fareData = null;
   let locked = null;
   if (quote_id) {
@@ -183,10 +267,9 @@ app.post('/rides/request', async (req, res) => {
       console.log(`🔒 Using locked quote ${quote_id} fare ₹${locked.total} for ${cust.customer_id}`);
     }
   }
-  // If no locked quote, client sent distance - fallback (less accurate, but prevents app break)
   if (!fareData) {
     if (client_distance && client_fare) {
-      console.log(`⚠️ No locked quote, using client values distance ${client_distance} fare ${client_fare} - encourage app to use /fare/quote`);
+      console.log(`⚠️ No locked quote, using client values distance ${client_distance} fare ${client_fare}`);
       fareData = { total: Number(client_fare), breakdown: null, distance_km: Number(client_distance) };
     } else {
       return res.status(400).json({ error: 'Please get fare quote first: POST /fare/quote with from/to' });
@@ -333,52 +416,40 @@ app.get('/rides', async (req, res) => {
   }
 });
 
-
-// ---- Razorpay + Wallet/Subscription (mount AFTER other routes, BEFORE PORT) ----
+// ---- Razorpay + Wallet/Subscription ----
 try {
-  const { createClient } = require('@supabase/supabase-js');
-  const supa = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY)
-    ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
-    : null;
-  global.supabase = supa;
   const razor = require('./razorpay');
-  razor(app, { supabase: supa, redis, driverReg, io });
+  razor(app, { supabase, redis, driverReg, io });
   console.log('✅ Razorpay mounted: /rider/payment/order + /rider/payment/verify');
 
   const walletSub = require('./wallet_subscription_merged');
   if (typeof walletSub === 'function') {
-    walletSub(app, { supabase: supa, redis, driverReg, io });
+    walletSub(app, { supabase, redis, driverReg, io });
     console.log('✅ Wallet/Sub mounted');
   } else if (walletSub && typeof walletSub.mount === 'function') {
-    walletSub.mount(app, { supabase: supa, redis, driverReg, io });
+    walletSub.mount(app, { supabase, redis, driverReg, io });
     console.log('✅ Wallet/Sub mounted via .mount');
   }
 } catch(e) {
-  console.log('Mount error', e.message, e.stack);
+  console.log('Mount error', e.message);
 }
 
 // Health check for razorpay keys
 app.get('/health/razorpay', (req,res)=>{
   const hasKey = !!(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
-  res.json({ configured: hasKey, key_id_present: !!process.env.RAZORPAY_KEY_ID, key_prefix: (process.env.RAZORPAY_KEY_ID||'').substring(0,8), mode: hasKey ? 'LIVE' : 'MISSING_KEYS' });
+  res.json({ configured: hasKey, key_id_present: !!process.env.RAZORPAY_KEY_ID, key_prefix: (process.env.RAZORPAY_KEY_ID||'').substring(0,8), mode: (process.env.RAZORPAY_KEY_ID||'').startsWith('rzp_live')?'LIVE': hasKey?'TEST':'MISSING_KEYS' });
 });
 
-
-// Add to driver_registration.js or index.js - Driver UPI save
+// Driver UPI direct to bank - zero commission
 app.post('/driver/upi', async (req, res) => {
   try {
     const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
     if (!token) return res.status(401).json({error: 'Login required'});
-    const { createClient } = require('@supabase/supabase-js');
-    const supa = global.supabase || (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {auth:{persistSession:false}}) : null);
-    if (!supa) return res.status(500).json({error: 'Supabase not configured'});
+    if (!supabase) return res.status(500).json({error: 'Supabase not configured'});
     
-    // Verify driver token
-    const driverReg = require('./driver_registration');
     let driver = null;
     try { driver = await driverReg.verifyDriverToken(token); } catch(_){}
     if (!driver) {
-      // fallback JWT
       try { const jwt = require('jsonwebtoken'); driver = jwt.verify(token, process.env.JWT_SECRET || ''); } catch(_){}
     }
     if (!driver) return res.status(401).json({error: 'Invalid token'});
@@ -387,7 +458,7 @@ app.post('/driver/upi', async (req, res) => {
     const { upi_id } = req.body;
     if (!upi_id || !upi_id.includes('@')) return res.status(400).json({error: 'Valid UPI ID required e.g. 9886180011@ybl'});
     
-    const { data, error } = await supa.from('drivers').update({ upi_id: upi_id.trim(), updated_at: new Date().toISOString() }).eq('driver_id', driver_id).select().maybeSingle();
+    const { data, error } = await supabase.from('drivers').update({ upi_id: upi_id.trim(), updated_at: new Date().toISOString() }).eq('driver_id', driver_id).select().maybeSingle();
     if (error) {
       console.log('UPI save error', error.message);
       return res.status(500).json({error: error.message});
@@ -401,14 +472,11 @@ app.post('/driver/upi', async (req, res) => {
 
 app.get('/driver/upi/:id', async (req, res) => {
   try {
-    const { createClient } = require('@supabase/supabase-js');
-    const supa = global.supabase || (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, {auth:{persistSession:false}}) : null);
-    const { data } = await supa.from('drivers').select('driver_id, upi_id').eq('driver_id', req.params.id).maybeSingle();
+    if (!supabase) return res.json({upi_id: null});
+    const { data } = await supabase.from('drivers').select('driver_id, upi_id').eq('driver_id', req.params.id).maybeSingle();
     res.json(data || {upi_id: null});
   } catch(e) { res.json({upi_id: null}); }
 });
 
-
 const PORT = process.env.PORT || 3000;
-
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Karnataka Fares - Running on PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Karnataka Fares + Landing - Running on PORT ${PORT}`));
