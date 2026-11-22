@@ -421,17 +421,28 @@ try {
   const razor = require('./razorpay');
   razor(app, { supabase, redis, driverReg, io });
   console.log('✅ Razorpay mounted: /rider/payment/order + /rider/payment/verify');
+} catch(e) { console.log('Razorpay mount error', e.message); }
 
-  const walletSub = require('./wallet_subscription_merged');
-  if (typeof walletSub === 'function') {
-    walletSub(app, { supabase, redis, driverReg, io });
-    console.log('✅ Wallet/Sub mounted');
-  } else if (walletSub && typeof walletSub.mount === 'function') {
-    walletSub.mount(app, { supabase, redis, driverReg, io });
-    console.log('✅ Wallet/Sub mounted via .mount');
+try {
+  let walletSub = null;
+  try { walletSub = require('./wallet_subscription_merged'); } 
+  catch(e1) { 
+    try { walletSub = require('./wallet_subscription'); }
+    catch(e2) {
+      try { walletSub = require('./wallet'); } catch(e3) { console.log('Wallet optional - not found, skipping'); }
+    }
+  }
+  if (walletSub) {
+    if (typeof walletSub === 'function') {
+      walletSub(app, { supabase, redis, driverReg, io });
+      console.log('✅ Wallet/Sub mounted');
+    } else if (walletSub && typeof walletSub.mount === 'function') {
+      walletSub.mount(app, { supabase, redis, driverReg, io });
+      console.log('✅ Wallet/Sub mounted via .mount');
+    }
   }
 } catch(e) {
-  console.log('Mount error', e.message);
+  console.log('Wallet mount error', e.message);
 }
 
 // Health check for razorpay keys
