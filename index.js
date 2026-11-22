@@ -87,7 +87,7 @@ a{color:#16a34a;text-decoration:none}
 <p><b>Business Type:</b> Individual - Transportation Service</p>
 <p><b>Website:</b> https://saas-backend-avz2.onrender.com</p>
 <p><b>Contact:</b> rajesh.keshavan@okaxis / 9886180011</p>
-<p><b>Address:</b> Bengaluru, Karnataka, India 560045</p>
+<p><b>Address:</b> No 7, SK Nivas, Muneshwara Temple Street, Subbanna Palayam, MS Nagar PO, Bangalore 560033, Karnataka, India</p>
 <p><b>Service Area:</b> Karnataka - Bengaluru Urban</p>
 <br><h3>Policies</h3><p><a href="/privacy">Privacy Policy</a> | <a href="/terms">Terms</a> | <a href="/refund">Refund & Cancellation</a> | <a href="/contact">Contact Us</a></p>
 </div>
@@ -117,7 +117,7 @@ app.get('/', (req, res) => {
 app.get('/privacy', (req,res)=>res.send('<h1>Privacy Policy - UrbanRide</h1><p>We collect phone, location, ride data for service. UPI IDs stored securely in Supabase. No data sold. Data retained per legal requirements. Contact: 9886180011</p><p>Last updated: Nov 2026</p><br><a href="/">Home</a>'));
 app.get('/terms', (req,res)=>res.send('<h1>Terms of Service - UrbanRide</h1><p>Drivers must have valid DL, RC, Permit, Insurance. Fares per Karnataka Govt notification. Platform fee Rs25/35 daily non-refundable unless service down >24h. Zero commission model - ride fare direct to driver.</p><br><a href="/">Home</a>'));
 app.get('/refund', (req,res)=>res.send('<h1>Refund & Cancellation Policy - UrbanRide</h1><p>Platform fee Rs25/35 daily: Refund if service not usable for >24h due to technical issue, processed via Razorpay within 5-7 days. Ride fare: Direct between customer and driver via UPI, not held by UrbanRide, so no refund via platform. Cancellation: Ride can be cancelled before driver arrival without charge.</p><p>Contact: 9886180011 / rajesh.keshavan@okaxis</p><br><a href="/">Home</a>'));
-app.get('/contact', (req,res)=>res.send('<h1>Contact Us - UrbanRide</h1><p><b>UrbanRide</b><br>Phone: 9886180011<br>Email: rajesh.keshavan@okaxis<br>Address: Baiyyappanahalli, Bengaluru, Karnataka 560045<br>Business: Individual - Transportation</p><br><a href="/">Home</a>'));
+app.get('/contact', (req,res)=>res.send('<h1>Contact Us - UrbanRide</h1><p><b>UrbanRide</b><br>Phone: 9886180011<br>Email: rajesh.keshavan@okaxis<br>Address: No 7, SK Nivas, Muneshwara Temple Street, Subbanna Palayam, MS Nagar PO, Bangalore 560033, Karnataka, India<br>Business: Individual - Transportation</p><br><a href="/">Home</a>'));
 app.get('/health', (req,res)=>res.json({ ok:true, time: new Date().toISOString(), redis: redis.status, supabase: !!supabase }));
 
 // the one-time trip PIN must never be sent to drivers
