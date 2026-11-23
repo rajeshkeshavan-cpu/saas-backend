@@ -26,8 +26,8 @@ const supabase =
     : null;
 if (!supabase) console.log('⚠️  Supabase not configured (set SUPABASE_URL and SUPABASE_SERVICE_KEY)');
 
-const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
-if (!process.env.JWT_SECRET) console.log('⚠️  JWT_SECRET not set - driver logins will reset on every restart');
+const JWT_SECRET = process.env.JWT_SECRET || 'urbanride_secret';
+if (!process.env.JWT_SECRET) console.log('⚠️  JWT_SECRET not set - using default urbanride_secret');
 if (!process.env.ADMIN_PASSWORD) console.log('⚠️  ADMIN_PASSWORD not set - admin page is disabled');
 
 const upload = multer({
