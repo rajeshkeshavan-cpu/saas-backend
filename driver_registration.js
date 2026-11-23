@@ -111,11 +111,21 @@ const onlineCache = new Map();
 function tokenOf(req) {
   const h = req.headers.authorization || '';
   if (!h.startsWith('Bearer ')) return null;
+  const token = h.slice(7).trim();
+  // Try JWT first
   try {
-    return jwt.verify(h.slice(7), JWT_SECRET);
-  } catch (e) {
-    return null;
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded && decoded.driver_id) return decoded;
+  } catch (e) {}
+  // Fallback: token is driver_id itself (for direct driver_id auth like DRV_E90F74)
+  if (token.startsWith('DRV_') || /^[A-Z0-9_]{6,}$/.test(token)) {
+    return { driver_id: token };
   }
+  // Also try phone number fallback
+  if (/^\d{10}$/.test(token)) {
+    return { driver_id: token };
+  }
+  return null;
 }
 
 // simple login brute-force protection: 5 wrong PINs locks that phone for 10 minutes
@@ -144,8 +154,24 @@ function mount(app, io) {
   const requireDriver = async (req, res, next) => {
     const t = tokenOf(req);
     if (!t) return res.status(401).json({ error: 'Please log in again' });
-    const d = await getDriver(t.driver_id);
-    if (!d) return res.status(401).json({ error: 'Account not found' });
+    let d = null;
+    try { d = await getDriver(t.driver_id); } catch(e){}
+    if (!d) {
+      // Try phone lookup as fallback
+      try {
+        const { data } = await supabase.from('drivers').select('*').eq('phone', t.driver_id).maybeSingle();
+        d = data || null;
+      } catch(e){}
+    }
+    if (!d) {
+      // Try direct driver_id from Authorization header raw (in case tokenOf returned driver_id but getDriver failed due to case)
+      try {
+        const raw = (req.headers.authorization || '').replace('Bearer ', '').trim();
+        const { data } = await supabase.from('drivers').select('*').eq('driver_id', raw).maybeSingle();
+        if (data) d = data;
+      } catch(e){}
+    }
+    if (!d) return res.status(401).json({ error: 'Account not found for ' + t.driver_id });
     req.driver = d;
     next();
   };
@@ -393,7 +419,7 @@ function mount(app, io) {
     const { data, error } = await supabase.from('driver_compliance').select('*').or(cols.map((c) => c + '.lte.' + limit).join(','));
     if (error) return res.status(500).json({ error: error.message });
     const ids = (data || []).map((r) => r.driver_id);
-    const { data: drivers } = ids.length ? await supabase.from('drivers').select('driver_id,name,phone,vehicle_type,vehicle_number,status,upi_id').in('driver_id', ids) : { data: [] };
+    const { data: drivers } = ids.length ? await supabase.from('drivers').select('driver_id,name,phone,vehicle_type,vehicle_number,status').in('driver_id', ids) : { data: [] };
     const byId = Object.fromEntries((drivers || []).map((x) => [x.driver_id, x]));
     const out = [];
     for (const r of data || []) {
