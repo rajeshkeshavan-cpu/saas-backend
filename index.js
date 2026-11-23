@@ -3,6 +3,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
 const crypto = require('crypto');
+const fs = require('fs');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -15,104 +17,16 @@ const redis = new Redis(process.env.REDIS_URL || undefined, process.env.REDIS_UR
 redis.on('connect', () => console.log('✅ Redis connected'));
 redis.on('error', (err) => console.log('Redis error:', err.message));
 
-// In-memory rides + driver presence
+// Supabase
+const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
+  : null;
+global.supabase = supabase;
+if (!supabase) console.log('⚠️ Supabase not configured');
+
+// In-memory rides
 const rides = new Map();
 global.onlineDrivers = {};
-
-// driver registration, document upload and admin verification
-
-// ---- FIXED UPLOAD PRIORITY - Must be BEFORE driverReg mount ----
-const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10*1024*1024 } });
-const ALL_DOCS = ['SELFIE','DL','RC','AADHAAR','PERMIT','INSURANCE','POLICE','FITNESS'];
-
-
-app.get('/driver/me', async (req, res) => {
-  try {
-    const auth = (req.headers.authorization || '').replace('Bearer ', '').trim();
-    if (!auth) return res.status(401).json({ error: 'No token' });
-    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    const { data: driver } = await supabase.from('drivers').select('*').eq('driver_id', auth).maybeSingle();
-    if (!driver) return res.status(401).json({ error: 'Driver not found: ' + auth });
-    const { data: docs } = await supabase.from('driver_documents').select('doc_type,status,uploaded_at,storage_path').eq('driver_id', auth);
-    
-    // Create signed URLs for each doc
-    let docsWithUrls = [];
-    if (docs && docs.length > 0) {
-      for (let d of docs) {
-        let url = null;
-        if (d.storage_path) {
-          try {
-            const { data: signed } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').createSignedUrl(d.storage_path, 60*10);
-            url = signed?.signedUrl || null;
-          } catch(e){ console.log('signed url failed', d.doc_type, e.message); }
-        }
-        docsWithUrls.push({ ...d, url });
-      }
-    }
-    
-    // Fallback: also check drivers table columns (selfie_url, dl_url etc) for old uploads
-    const fallbackDocs = [];
-    const driverDocMap = {
-      'SELFIE': driver.selfie_url || driver.photo_url || driver.profile_photo,
-      'DL': driver.driving_license_url || driver.dl_url || driver.license_url,
-      'AADHAAR': driver.aadhaar_url,
-      'RC': driver.rc_url || driver.rc_book_url,
-      'PERMIT': driver.permit_url || driver.vehicle_permit_url,
-      'INSURANCE': driver.insurance_url,
-      'POLICE': driver.police_verification_url || driver.police_url
-    };
-    for (let [type, url] of Object.entries(driverDocMap)) {
-      if (url) {
-        // If not already in docsWithUrls, add fallback
-        const exists = docsWithUrls.find(x => x.doc_type === type);
-        if (!exists) {
-          fallbackDocs.push({ doc_type: type, status: 'APPROVED', storage_path: url, url: url, uploaded_at: driver.updated_at });
-        }
-      }
-    }
-    
-    const allDocs = [...docsWithUrls, ...fallbackDocs];
-    console.log(`[ME] ${auth} -> ${allDocs.length} docs (${docsWithUrls.length} from driver_documents, ${fallbackDocs.length} fallback)`);
-    
-    const { data: comp } = await supabase.from('driver_compliance').select('*').eq('driver_id', auth).maybeSingle();
-    res.json({ driver, documents: allDocs, compliance: comp || {} });
-  } catch(e){ console.error('/driver/me error', e); res.status(500).json({ error: e.message }); }
-});
-
-app.get('/driver/docs/:type/url', async (req, res) => {
-  try {
-    const auth = (req.headers.authorization || '').replace('Bearer ', '').trim();
-    const type = String(req.params.type).toUpperCase();
-    if (!auth) return res.status(401).json({ error: 'No token' });
-    if (!supabase) return res.status(500).json({ error: 'Supabase not configured' });
-    // Try driver_documents first
-    const { data: doc } = await supabase.from('driver_documents').select('storage_path,doc_type,status').eq('driver_id', auth).eq('doc_type', type).maybeSingle();
-    if (doc && doc.storage_path) {
-      const { data: signed, error: signErr } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').createSignedUrl(doc.storage_path, 60*5);
-      if (signErr) return res.status(500).json({ error: signErr.message });
-      return res.json({ url: signed.signedUrl, doc_type: type, storage_path: doc.storage_path, status: doc.status });
-    }
-    // Fallback to drivers table column
-    const { data: driver } = await supabase.from('drivers').select('*').eq('driver_id', auth).maybeSingle();
-    if (driver) {
-      const map = {
-        'SELFIE': driver.selfie_url || driver.photo_url,
-        'DL': driver.driving_license_url || driver.dl_url,
-        'AADHAAR': driver.aadhaar_url,
-        'RC': driver.rc_url || driver.rc_book_url,
-        'PERMIT': driver.permit_url || driver.vehicle_permit_url,
-        'INSURANCE': driver.insurance_url,
-        'POLICE': driver.police_verification_url
-      };
-      const fallbackUrl = map[type];
-      if (fallbackUrl) {
-        return res.json({ url: fallbackUrl, doc_type: type, storage_path: fallbackUrl, status: 'APPROVED' });
-      }
-    }
-    return res.status(404).json({ error: 'Document not found for ' + type + ' driver_id=' + auth });
-  } catch(e){ console.error('doc url error', e); res.status(500).json({ error: e.message }); }
-});
 
 app.post('/driver/docs/upload', (req, res) => {
   upload.any()(req, res, async (err) => {
