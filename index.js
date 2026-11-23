@@ -1,3 +1,4 @@
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -5,6 +6,7 @@ const Redis = require('ioredis');
 const crypto = require('crypto');
 const fs = require('fs');
 const { createClient } = require('@supabase/supabase-js');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -12,57 +14,120 @@ app.use(express.urlencoded({ extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// Redis
 const redis = new Redis(process.env.REDIS_URL || undefined, process.env.REDIS_URL ? { tls: {} } : {});
 redis.on('connect', () => console.log('✅ Redis connected'));
 redis.on('error', (err) => console.log('Redis error:', err.message));
 
-// Supabase
 const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY)
   ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
   : null;
 global.supabase = supabase;
 if (!supabase) console.log('⚠️ Supabase not configured');
 
-// In-memory rides
 const rides = new Map();
 global.onlineDrivers = {};
+
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10*1024*1024 } });
+const ALL_DOCS = ['SELFIE','DL','RC','AADHAAR','PERMIT','INSURANCE','POLICE','FITNESS'];
+const JWT_SECRET = process.env.JWT_SECRET || 'urbanride_secret';
+
+function getDriverIdFromToken(token) {
+  if (!token) return null;
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded && decoded.driver_id) return decoded.driver_id;
+  } catch(e) {}
+  return token;
+}
 
 app.post('/driver/docs/upload', (req, res) => {
   upload.any()(req, res, async (err) => {
     try {
       if (err) return res.status(400).json({ error: err.message });
-      const auth = (req.headers.authorization || '').replace('Bearer ', '').trim();
-      if (!auth) return res.status(401).json({ error: 'No token' });
-      const { data: driver } = await supabase.from('drivers').select('*').eq('driver_id', auth).maybeSingle();
+      const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+      if (!rawAuth) return res.status(401).json({ error: 'No token' });
+      const driverId = getDriverIdFromToken(rawAuth);
+      console.log(`[UPLOAD] raw=${rawAuth.substring(0,20)} decoded=${driverId}`);
+      let driver = null;
+      const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+      driver = d1;
       if (!driver) {
-        const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', auth).maybeSingle();
-        if (!d2) return res.status(401).json({ error: 'Invalid driver token ' + auth });
+        const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+        driver = d2;
       }
+      if (!driver && rawAuth !== driverId) {
+        const { data: d3 } = await supabase.from('drivers').select('*').eq('driver_id', rawAuth).maybeSingle();
+        driver = d3;
+      }
+      if (!driver) return res.status(401).json({ error: 'Driver not found for ' + rawAuth });
       const type = (req.body.doc_type || '').toUpperCase();
       if (!ALL_DOCS.includes(type)) return res.status(400).json({ error: 'doc_type required' });
       let file = req.files && req.files.length>0 ? req.files[0] : null;
       if (!file) return res.status(400).json({ error: 'file required' });
       const ext = (file.originalname?.split('.').pop() || 'jpg').toLowerCase();
-      const fileName = `${auth}/${type}_${Date.now()}.${ext}`;
-      console.log(`[UPLOAD] ${auth} ${type} -> ${fileName}`);
+      const fileName = `${driver.driver_id}/${type}_${Date.now()}.${ext}`;
+      console.log(`[UPLOAD] ${driver.driver_id} ${type} -> ${fileName}`);
       const { error: upErr } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').upload(fileName, file.buffer, { contentType: file.mimetype || 'image/jpeg', upsert: true });
       if (upErr) return res.status(500).json({ error: upErr.message });
-      const { data: existing } = await supabase.from('driver_documents').select('*').eq('driver_id', auth).eq('doc_type', type).maybeSingle();
+      const { data: existing } = await supabase.from('driver_documents').select('*').eq('driver_id', driver.driver_id).eq('doc_type', type).maybeSingle();
       if (existing) {
-        await supabase.from('driver_documents').update({ storage_path: fileName, status: 'PENDING_VERIFICATION', uploaded_at: new Date().toISOString() }).eq('driver_id', auth).eq('doc_type', type);
+        await supabase.from('driver_documents').update({ storage_path: fileName, status: 'PENDING_VERIFICATION', uploaded_at: new Date().toISOString() }).eq('driver_id', driver.driver_id).eq('doc_type', type);
       } else {
-        await supabase.from('driver_documents').insert({ driver_id: auth, doc_type: type, storage_path: fileName, status: 'PENDING_VERIFICATION' });
+        await supabase.from('driver_documents').insert({ driver_id: driver.driver_id, doc_type: type, storage_path: fileName, status: 'PENDING_VERIFICATION' });
       }
-      const { data: signed } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').createSignedUrl(fileName, 300);
-      console.log(`[UPLOAD OK] ${auth} ${type}`);
-      res.json({ ok: true, doc_type: type, url: signed?.signedUrl, storage_path: fileName });
+      const { data: signed } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').createSignedUrl(fileName, 600);
+      console.log(`[UPLOAD OK] ${driver.driver_id} ${type}`);
+      res.json({ ok: true, doc_type: type, storage_path: fileName, url: signed?.signedUrl });
     } catch(e){ console.error(e); res.status(500).json({ error: e.message }); }
   });
 });
 
+app.get('/driver/me', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    driver = d1;
+    if (!driver) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      driver = d2;
+    }
+    if (!driver) return res.status(401).json({ error: 'Driver not found ' + rawAuth });
+    const { data: docs } = await supabase.from('driver_documents').select('doc_type,status,uploaded_at,storage_path').eq('driver_id', driver.driver_id);
+    let docsWithUrls = [];
+    if (docs) {
+      for (let d of docs) {
+        let url = null;
+        if (d.storage_path) {
+          try {
+            const { data: signed } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').createSignedUrl(d.storage_path, 600);
+            url = signed?.signedUrl || null;
+          } catch(e){}
+        }
+        docsWithUrls.push({ ...d, url });
+      }
+    }
+    console.log(`[ME] ${driver.driver_id} -> ${docsWithUrls.length} docs`);
+    const { data: comp } = await supabase.from('driver_compliance').select('*').eq('driver_id', driver.driver_id).maybeSingle();
+    res.json({ driver, documents: docsWithUrls, compliance: comp || {} });
+  } catch(e){ console.error(e); res.status(500).json({ error: e.message }); }
+});
 
-
+app.get('/driver/docs/:type/url', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    const type = String(req.params.type).toUpperCase();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    const { data: doc } = await supabase.from('driver_documents').select('storage_path,status').eq('driver_id', driverId).eq('doc_type', type).maybeSingle();
+    if (!doc || !doc.storage_path) return res.status(404).json({ error: 'Not found ' + type });
+    const { data: signed } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').createSignedUrl(doc.storage_path, 600);
+    res.json({ url: signed.signedUrl, doc_type: type, storage_path: doc.storage_path, status: doc.status });
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
 
 
 const driverReg = require('./driver_registration');
@@ -379,4 +444,6 @@ app.get('/rides', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Karnataka Fares - Running on PORT ${PORT}`));
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V53 JWT+URL FIXED - PORT ${PORT}`));
