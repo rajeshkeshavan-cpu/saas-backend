@@ -443,5 +443,11 @@ app.get('/rides', async (req, res) => {
   }
 });
 
+
+app.get('/health', (req,res) => {
+  res.json({ status:'LIVE', backend:'saas-backend-avz2', razorpay: process.env.RAZORPAY_KEY_ID?.startsWith('rzp_live') ? 'LIVE' : 'TEST', supabase: !!supabase, timestamp: new Date().toISOString() });
+});
+app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V55' }));
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V54 JWT+URL+PORT FIX - PORT ${PORT}`));
