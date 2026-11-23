@@ -489,5 +489,12 @@ app.get('/driver/upi/:id', async (req, res) => {
   } catch(e) { res.json({upi_id: null}); }
 });
 
+app.get('/driver/documents', (req,res) => {
+  const {driver_id} = req.query;
+  // fetch from Supabase driver table
+  res.json({ driving_license: row.license_url, aadhaar: row.aadhaar_url, rc: row.rc_url, insurance: row.insurance_url });
+});
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend Karnataka Fares + Landing - Running on PORT ${PORT}`));
+
