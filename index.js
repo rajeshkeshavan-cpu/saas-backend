@@ -522,6 +522,94 @@ app.get('/rides', async (req, res) => {
 });
 
 
+
+// ---- RIDER PAYMENT (for customer app) ----
+app.post('/rider/payment/order', async (req, res) => {
+  try {
+    const { ride_id, amount, driver_id } = req.body;
+    if (!amount) return res.status(400).json({ error: 'amount required' });
+    const amt = Math.round(Number(amount) * 100); // paise
+    if (amt < 100) return res.status(400).json({ error: 'amount too small' });
+    
+    const receipt = `ride_${(ride_id||'').toString().substring(0,20)}_${Date.now()}`.substring(0,40);
+    
+    if (!razorpay) {
+      // Fallback if razorpay not configured - return mock order for testing
+      console.log('[RIDER PAY] Razorpay not configured, returning mock order');
+      return res.json({ 
+        order_id: `order_mock_${Date.now()}`, 
+        amount: amt, 
+        currency: 'INR', 
+        receipt,
+        key_id: process.env.RAZORPAY_KEY_ID || 'rzp_live_mock',
+        mock: true 
+      });
+    }
+    
+    const order = await razorpay.orders.create({
+      amount: amt,
+      currency: 'INR',
+      receipt,
+      notes: { ride_id: ride_id || '', driver_id: driver_id || '', type: 'ride_fare' }
+    });
+    
+    console.log(`[RIDER PAY ORDER] ride=${ride_id} amount=${amount} order=${order.id}`);
+    res.json({ 
+      order_id: order.id, 
+      amount: order.amount, 
+      currency: order.currency, 
+      receipt: order.receipt,
+      key_id: process.env.RAZORPAY_KEY_ID,
+      ride_id 
+    });
+  } catch(e){
+    console.error('rider payment order error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/rider/payment/verify', async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, ride_id, amount } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: 'Missing razorpay fields' });
+    }
+    
+    // Verify signature
+    const crypto = await import('crypto');
+    const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '').update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');
+    
+    if (expected !== razorpay_signature) {
+      console.log(`[RIDER PAY VERIFY FAIL] expected ${expected} got ${razorpay_signature}`);
+      // For mock orders, allow
+      if (!razorpay_order_id.startsWith('order_mock_')) {
+        return res.status(400).json({ error: 'Invalid signature' });
+      }
+    }
+    
+    console.log(`[RIDER PAY VERIFY OK] ride=${ride_id} payment=${razorpay_payment_id} amount=${amount}`);
+    
+    // Mark ride as paid if ride_id provided
+    if (ride_id) {
+      try {
+        await supabase.from('rides').update({ payment_status: 'PAID', payment_id: razorpay_payment_id, paid_at: new Date().toISOString() }).eq('id', ride_id);
+      } catch(e){ console.log('ride update paid error', e.message); }
+    }
+    
+    res.json({ ok: true, verified: true, payment_id: razorpay_payment_id, ride_id });
+  } catch(e){
+    console.error('rider payment verify error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Also support /rider/payment/order alternative path used by some apps
+app.post('/rider/pay/order', (req,res) => {
+  req.url = '/rider/payment/order';
+  app._router.handle(req,res);
+});
+
+
 app.get('/health', (req,res) => {
   res.json({ status:'LIVE', backend:'saas-backend-avz2', razorpay: process.env.RAZORPAY_KEY_ID?.startsWith('rzp_live') ? 'LIVE' : 'TEST', supabase: !!supabase, timestamp: new Date().toISOString() });
 });
