@@ -135,15 +135,16 @@ app.get('/driver/me', async (req, res) => {
     const missing = requiredDocs.filter(rd => !docs || !docs.find(dd => dd.doc_type === rd && dd.status === 'APPROVED'));
     let compliance = {};
     if (isSuperAdmin) {
-      compliance = { ok: true, is_super_admin: true, driver_id: driver.driver_id, issues: [], warnings: [], ...compRow };
+      compliance = { ok: true, is_super_admin: true, driver_id: driver.driver_id, issues: [], warnings: [], ...(compRow||{}) };
     } else if (missing.length === 0) {
-      compliance = { ok: true, is_super_admin: false, driver_id: driver.driver_id, issues: [], warnings: [], ...compRow };
+      compliance = { ok: true, is_super_admin: false, driver_id: driver.driver_id, issues: [], warnings: [], ...(compRow||{}) };
     } else {
-      compliance = { ok: false, is_super_admin: false, driver_id: driver.driver_id, issues: missing.map(m => `${m} document pending approval`), warnings: [], ...compRow };
+      compliance = { ok: false, is_super_admin: false, driver_id: driver.driver_id, issues: missing.map(m => `${m} document pending approval`), warnings: [], ...(compRow||{}) };
     }
     let subscription = { blocked: false, is_super_admin: isSuperAdmin, plan: isSuperAdmin ? 'SUPER_ADMIN_FREE' : 'FREE_TRIAL', message: isSuperAdmin ? 'Super Admin - fee bypassed until E2E test complete' : '' };
     res.json({ driver: { ...driver, is_super_admin: isSuperAdmin }, documents: docsWithUrls, compliance, subscription, is_super_admin: isSuperAdmin });
-
+  } catch(e){ console.error(e); res.status(500).json({ error: e.message }); }
+});
 
 
 app.delete('/driver/account', async (req, res) => {
