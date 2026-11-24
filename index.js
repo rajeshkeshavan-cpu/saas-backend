@@ -603,6 +603,108 @@ app.post('/rider/payment/verify', async (req, res) => {
   }
 });
 
+
+// ---- DRIVER PROFILE & UPI & WALLET (fix 404) ----
+app.get('/driver/profile', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    driver = d1;
+    if (!driver) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      driver = d2;
+    }
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+    res.json({ driver, upi_id: driver.upi_id || '' });
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
+
+app.post('/driver/upi', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    const { upi_id } = req.body;
+    if (!upi_id || !upi_id.includes('@')) return res.status(400).json({ error: 'Invalid UPI ID' });
+    
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    driver = d1;
+    if (!driver) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      driver = d2;
+    }
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+    
+    const { data, error } = await supabase.from('drivers').update({ upi_id: upi_id.trim(), updated_at: new Date().toISOString() }).eq('driver_id', driver.driver_id).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    
+    console.log(`[UPI SAVE] ${driver.driver_id} -> ${upi_id}`);
+    res.json({ ok: true, driver: data, upi_id: data.upi_id });
+  } catch(e){ console.error('upi save error', e); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/driver/wallet', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    driver = d1;
+    if (!driver) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      driver = d2;
+    }
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+    
+    // Try get wallet from driver_wallets table, fallback to empty
+    let wallet = null;
+    try {
+      const { data: w } = await supabase.from('driver_wallets').select('*').eq('driver_id', driver.driver_id).maybeSingle();
+      wallet = w;
+    } catch(e){}
+    
+    if (!wallet) {
+      // Create default wallet for driver
+      wallet = { driver_id: driver.driver_id, balance: 0, total_earnings: 0, total_rides: 0, subscription_due: 0, subscription_status: 'ACTIVE', current_plan: null, plan_expires_at: null, vehicle_type: driver.vehicle_type || 'TAXI', trial_rides_left: 3 };
+    }
+    
+    // Get transactions if table exists
+    let txns = [];
+    try {
+      const { data: t } = await supabase.from('wallet_transactions').select('*').eq('driver_id', driver.driver_id).order('created_at', { ascending: false }).limit(20);
+      txns = t || [];
+    } catch(e){}
+    
+    res.json({ ...wallet, transactions: txns, upi_id: driver.upi_id || '' });
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
+
+app.get('/driver/subscription', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    const SUPER_ADMINS = ['DRV_E90F74','DRV_EAD55B','9886180011','8431670039'];
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    driver = d1;
+    if (!driver) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      driver = d2;
+    }
+    const isSuper = driver && (SUPER_ADMINS.includes(driver.driver_id) || SUPER_ADMINS.includes(driver.phone));
+    if (isSuper) {
+      return res.json({ blocked: false, is_super_admin: true, plan: 'SUPER_ADMIN_FREE', message: 'Super Admin - fee bypassed' });
+    }
+    res.json({ blocked: false, plan: 'FREE_TRIAL', trial_rides_left: 3 });
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
+
 app.get('/health', (req,res) => {
   res.json({ status:'LIVE', backend:'saas-backend-avz2', razorpay: process.env.RAZORPAY_KEY_ID?.startsWith('rzp_live') ? 'LIVE' : 'TEST', supabase: !!supabase, timestamp: new Date().toISOString() });
 });
