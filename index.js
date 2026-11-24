@@ -76,10 +76,21 @@ app.post('/driver/docs/upload', (req, res) => {
       const { error: upErr } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').upload(fileName, file.buffer, { contentType: mime, upsert: true });
       if (upErr) return res.status(500).json({ error: upErr.message });
       const { data: existing } = await supabase.from('driver_documents').select('*').eq('driver_id', driver.driver_id).eq('doc_type', type).maybeSingle();
+      console.log(`[UPLOAD] Existing doc: ${existing ? existing.storage_path : 'none'}`);
       if (existing) {
-        await supabase.from('driver_documents').update({ storage_path: fileName, status: 'PENDING_VERIFICATION', uploaded_at: new Date().toISOString() }).eq('driver_id', driver.driver_id).eq('doc_type', type);
+        const { data: upd, error: updErr } = await supabase.from('driver_documents').update({ storage_path: fileName, status: 'PENDING_VERIFICATION', uploaded_at: new Date().toISOString() }).eq('driver_id', driver.driver_id).eq('doc_type', type).select();
+        if (updErr) {
+          console.error('[UPLOAD] Update failed', updErr);
+          return res.status(500).json({ error: 'DB update failed: ' + updErr.message });
+        }
+        console.log('[UPLOAD] Updated DB', upd);
       } else {
-        await supabase.from('driver_documents').insert({ driver_id: driver.driver_id, doc_type: type, storage_path: fileName, status: 'PENDING_VERIFICATION' });
+        const { data: ins, error: insErr } = await supabase.from('driver_documents').insert({ driver_id: driver.driver_id, doc_type: type, storage_path: fileName, status: 'PENDING_VERIFICATION', uploaded_at: new Date().toISOString() }).select();
+        if (insErr) {
+          console.error('[UPLOAD] Insert failed', insErr);
+          return res.status(500).json({ error: 'DB insert failed: ' + insErr.message });
+        }
+        console.log('[UPLOAD] Inserted DB', ins);
       }
       const { data: signed } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').createSignedUrl(fileName, 600);
       console.log(`[UPLOAD OK] ${driver.driver_id} ${type}`);
