@@ -100,6 +100,7 @@ app.post('/driver/docs/upload', (req, res) => {
 });
 
 app.get('/driver/me', async (req, res) => {
+  const SUPER_ADMINS = ['DRV_E90F74','DRV_EAD55B','9886180011','8431670039'];
   try {
     const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
     if (!rawAuth) return res.status(401).json({ error: 'No token' });
@@ -109,13 +110,14 @@ app.get('/driver/me', async (req, res) => {
     driver = d1;
     if (!driver) {
       const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
-      driver = d2;
+      if (d2) driver = d2; else return res.status(404).json({ error: 'Driver not found ' + driverId });
     }
-    if (!driver) return res.status(401).json({ error: 'Driver not found ' + rawAuth });
-    const { data: docs } = await supabase.from('driver_documents').select('doc_type,status,uploaded_at,storage_path').eq('driver_id', driver.driver_id);
-    let docsWithUrls = [];
+    const isSuperAdmin = SUPER_ADMINS.includes(driver.driver_id) || SUPER_ADMINS.includes(driver.phone);
+    const { data: docs } = await supabase.from('driver_documents').select('*').eq('driver_id', driver.driver_id);
+    const docsWithUrls = [];
+    let approvedCount = 0;
     if (docs) {
-      for (let d of docs) {
+      for (const d of docs) {
         let url = null;
         if (d.storage_path) {
           try {
@@ -124,13 +126,24 @@ app.get('/driver/me', async (req, res) => {
           } catch(e){}
         }
         docsWithUrls.push({ ...d, url });
+        if (d.status === 'APPROVED') approvedCount++;
       }
     }
-    console.log(`[ME] ${driver.driver_id} -> ${docsWithUrls.length} docs`);
-    const { data: comp } = await supabase.from('driver_compliance').select('*').eq('driver_id', driver.driver_id).maybeSingle();
-    res.json({ driver, documents: docsWithUrls, compliance: comp || {} });
-  } catch(e){ console.error(e); res.status(500).json({ error: e.message }); }
-});
+    console.log(`[ME] ${driver.driver_id} -> ${docsWithUrls.length} docs approved=${approvedCount} super=${isSuperAdmin}`);
+    const { data: compRow } = await supabase.from('driver_compliance').select('*').eq('driver_id', driver.driver_id).maybeSingle();
+    const requiredDocs = ['SELFIE','DL','AADHAAR','RC','PERMIT','INSURANCE','POLICE'];
+    const missing = requiredDocs.filter(rd => !docs || !docs.find(dd => dd.doc_type === rd && dd.status === 'APPROVED'));
+    let compliance = {};
+    if (isSuperAdmin) {
+      compliance = { ok: true, is_super_admin: true, driver_id: driver.driver_id, issues: [], warnings: [], ...compRow };
+    } else if (missing.length === 0) {
+      compliance = { ok: true, is_super_admin: false, driver_id: driver.driver_id, issues: [], warnings: [], ...compRow };
+    } else {
+      compliance = { ok: false, is_super_admin: false, driver_id: driver.driver_id, issues: missing.map(m => `${m} document pending approval`), warnings: [], ...compRow };
+    }
+    let subscription = { blocked: false, is_super_admin: isSuperAdmin, plan: isSuperAdmin ? 'SUPER_ADMIN_FREE' : 'FREE_TRIAL', message: isSuperAdmin ? 'Super Admin - fee bypassed until E2E test complete' : '' };
+    res.json({ driver: { ...driver, is_super_admin: isSuperAdmin }, documents: docsWithUrls, compliance, subscription, is_super_admin: isSuperAdmin });
+
 
 
 app.delete('/driver/account', async (req, res) => {
@@ -308,7 +321,6 @@ app.post('/driver/:id/selfie', async (req, res) => {
   res.json({ verified: true, driver_id: req.params.id });
 });
 
-const SUPER_ADMIN_IDS = ['DRV_E90F74','DRV_EAD55B'];
 app.post('/driver/location', async (req, res) => {
   const { driver_id, lat, lng } = req.body;
   if (!driver_id || !lat || !lng) return res.status(400).json({ error: "Missing" });
