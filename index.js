@@ -78,14 +78,14 @@ app.post('/driver/docs/upload', (req, res) => {
       const { data: existing } = await supabase.from('driver_documents').select('*').eq('driver_id', driver.driver_id).eq('doc_type', type).maybeSingle();
       console.log(`[UPLOAD] Existing doc: ${existing ? existing.storage_path : 'none'}`);
       if (existing) {
-        const { data: upd, error: updErr } = await supabase.from('driver_documents').update({ storage_path: fileName, status: 'PENDING_VERIFICATION', uploaded_at: new Date().toISOString() }).eq('driver_id', driver.driver_id).eq('doc_type', type).select();
+        const { data: upd, error: updErr } = await supabase.from('driver_documents').update({ storage_path: fileName, status: 'PENDING', uploaded_at: new Date().toISOString() }).eq('driver_id', driver.driver_id).eq('doc_type', type).select();
         if (updErr) {
           console.error('[UPLOAD] Update failed', updErr);
           return res.status(500).json({ error: 'DB update failed: ' + updErr.message });
         }
         console.log('[UPLOAD] Updated DB', upd);
       } else {
-        const { data: ins, error: insErr } = await supabase.from('driver_documents').insert({ driver_id: driver.driver_id, doc_type: type, storage_path: fileName, status: 'PENDING_VERIFICATION', uploaded_at: new Date().toISOString() }).select();
+        const { data: ins, error: insErr } = await supabase.from('driver_documents').insert({ driver_id: driver.driver_id, doc_type: type, storage_path: fileName, status: 'PENDING', uploaded_at: new Date().toISOString() }).select();
         if (insErr) {
           console.error('[UPLOAD] Insert failed', insErr);
           return res.status(500).json({ error: 'DB insert failed: ' + insErr.message });
@@ -131,6 +131,54 @@ app.get('/driver/me', async (req, res) => {
     res.json({ driver, documents: docsWithUrls, compliance: comp || {} });
   } catch(e){ console.error(e); res.status(500).json({ error: e.message }); }
 });
+
+
+app.delete('/driver/account', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    console.log(`[DELETE ACCOUNT] raw=${rawAuth.substring(0,20)} decoded=${driverId}`);
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    driver = d1;
+    if (!driver) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      driver = d2;
+    }
+    if (!driver) return res.status(404).json({ error: 'Driver not found ' + driverId });
+    
+    const id = driver.driver_id;
+    console.log(`[DELETE] Deleting all records for ${id}`);
+    
+    // Delete in order
+    await supabase.from('driver_documents').delete().eq('driver_id', id);
+    await supabase.from('driver_compliance').delete().eq('driver_id', id);
+    // Delete storage files
+    try {
+      const { data: files } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').list(id);
+      if (files && files.length > 0) {
+        const fileNames = files.map(f => `${id}/${f.name}`);
+        await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').remove(fileNames);
+        console.log(`[DELETE] Removed ${fileNames.length} storage files`);
+      }
+    } catch(e){ console.log('storage delete error', e.message); }
+    
+    // Try delete subscriptions if table exists
+    try { await supabase.from('subscriptions').delete().eq('driver_id', id); } catch(e){}
+    try { await supabase.from('driver_subscriptions').delete().eq('driver_id', id); } catch(e){}
+    
+    const { error: delErr } = await supabase.from('drivers').delete().eq('driver_id', id);
+    if (delErr) return res.status(500).json({ error: 'Delete driver failed: ' + delErr.message });
+    
+    console.log(`[DELETE OK] ${id} deleted`);
+    res.json({ ok: true, deleted_driver_id: id, message: 'All driver records deleted' });
+  } catch(e){
+    console.error('delete account error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 
 app.get('/driver/docs/:type/url', async (req, res) => {
   try {
@@ -260,6 +308,7 @@ app.post('/driver/:id/selfie', async (req, res) => {
   res.json({ verified: true, driver_id: req.params.id });
 });
 
+const SUPER_ADMIN_IDS = ['DRV_E90F74','DRV_EAD55B'];
 app.post('/driver/location', async (req, res) => {
   const { driver_id, lat, lng } = req.body;
   if (!driver_id || !lat || !lng) return res.status(400).json({ error: "Missing" });
