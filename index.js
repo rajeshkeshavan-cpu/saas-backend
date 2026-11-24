@@ -67,8 +67,13 @@ app.post('/driver/docs/upload', (req, res) => {
       if (!file) return res.status(400).json({ error: 'file required' });
       const ext = (file.originalname?.split('.').pop() || 'jpg').toLowerCase();
       const fileName = `${driver.driver_id}/${type}_${Date.now()}.${ext}`;
-      console.log(`[UPLOAD] ${driver.driver_id} ${type} -> ${fileName}`);
-      const { error: upErr } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').upload(fileName, file.buffer, { contentType: file.mimetype || 'image/jpeg', upsert: true });
+      // Fix mime type - force image/jpeg if octet-stream
+      let mime = file.mimetype || 'image/jpeg';
+      if (mime === 'application/octet-stream' || !mime.startsWith('image/')) {
+        mime = ext === 'png' ? 'image/png' : 'image/jpeg';
+      }
+      console.log(`[UPLOAD] ${driver.driver_id} ${type} -> ${fileName} mime=${mime} orig=${file.mimetype} size=${file.buffer?.length}`);
+      const { error: upErr } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').upload(fileName, file.buffer, { contentType: mime, upsert: true });
       if (upErr) return res.status(500).json({ error: upErr.message });
       const { data: existing } = await supabase.from('driver_documents').select('*').eq('driver_id', driver.driver_id).eq('doc_type', type).maybeSingle();
       if (existing) {
