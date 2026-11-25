@@ -35,6 +35,41 @@ const ALL_DOCS = ['SELFIE','DL','RC','AADHAAR','PERMIT','INSURANCE','POLICE','FI
 const JWT_SECRET = process.env.JWT_SECRET || 'urbanride_secret';
 
 let razorpayInstance = null;
+
+// ---- AUTH for in-app messages (driver OR customer) ----
+function authenticate(req,res,next){
+  try{
+    const hdr = (req.headers.authorization||'').replace('Bearer ','').trim();
+    if(!hdr) return res.status(401).json({error:'No token'});
+    // Try JWT
+    try{
+      const decoded = jwt.verify(hdr, JWT_SECRET);
+      req.user = decoded;
+      return next();
+    }catch(e){}
+    // If not JWT, allow raw phone/driver_id token (customer & driver)
+    if(hdr.length>=6){
+      req.user = { token: hdr };
+      return next();
+    }
+    return res.status(401).json({error:'Invalid token'});
+  }catch(e){ return res.status(401).json({error:'Auth failed'}); }
+}
+
+// ---- In-memory ride messages (no DB, auto-clear after ride) ----
+const rideMessages = new Map();
+function addRideMessage(rideId, msg){
+  if(!rideMessages.has(rideId)) rideMessages.set(rideId, []);
+  rideMessages.get(rideId).push(msg);
+  if(rideMessages.get(rideId).length>50) rideMessages.set(rideId, rideMessages.get(rideId).slice(-50));
+}
+function clearRideMessages(rideId){
+  if(rideMessages.has(rideId)){
+    rideMessages.delete(rideId);
+    console.log(`🧹 Cleared messages for ${rideId}`);
+  }
+}
+
 function getRazorpay() {
   if (razorpayInstance) return razorpayInstance;
   const key_id = process.env.RAZORPAY_KEY_ID;
@@ -361,6 +396,7 @@ app.post('/driver/location', async (req, res) => {
   res.json({ success: true });
 });
 
+
 io.on('connection', (socket) => {
   console.log(`✅ Connected: ${socket.id}`);
   socket.on('driver:location:update', async (data) => {
@@ -376,10 +412,28 @@ io.on('connection', (socket) => {
       console.log('location error', e.message);
     }
   });
-  socket.on('join:ride', (ride_id) => {
-    socket.join(ride_id);
+  socket.on('join:ride', (rideId) => {
+    try{
+      const room = typeof rideId === 'string' ? rideId : rideId?.ride_id || rideId?.ride_id;
+      const r = room || rideId;
+      if(r){
+        socket.join(`ride_${r}`);
+        socket.join(r);
+        console.log(`Socket ${socket.id} joined ride_${r}`);
+      }
+    }catch(e){}
+  });
+  socket.on('ride_message', (data) => {
+    try{
+      const rideId = data?.ride_id || data?.rideId;
+      if(rideId){
+        io.to(`ride_${rideId}`).emit('ride_message', data);
+        io.to(rideId).emit('ride_message', data);
+      }
+    }catch(e){}
   });
 });
+
 
 // ---------- RIDES ----------
 app.post('/rides/request', async (req, res) => {
@@ -479,6 +533,7 @@ app.post('/rides/:id/cancel', async (req, res) => {
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
   console.log(`❌ Ride ${ride.ride_id} cancelled by ${ride.cancelled_by}: ${ride.cancel_reason}`);
+  clearRideMessages(ride.ride_id);
   io.emit('ride:cancelled', publicRide(ride));
   res.json({ success: true, ride: publicRide(ride) });
 });
@@ -516,6 +571,7 @@ app.post('/rides/:id/complete', async (req, res) => {
   ride.completed_at = new Date().toISOString();
   rides.set(ride.ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
+  clearRideMessages(ride.ride_id);
   io.emit('ride:completed', publicRide(ride));
   res.json({ success: true, ride: publicRide(ride) });
 });
@@ -549,6 +605,27 @@ app.get('/rides', async (req, res) => {
 });
 
 
+
+
+// ---- RIDE MESSAGES (in-app, disappears after ride) ----
+app.post('/rides/:id/message', authenticate, (req, res) => {
+  const rideId = req.params.id;
+  const from = (req.body.from || 'driver').toString().toLowerCase();
+  const text = (req.body.text || '').toString().trim();
+  if (!text) return res.status(400).json({error: 'text required'});
+  const msg = { ride_id: rideId, from, text, time: new Date().toISOString() };
+  addRideMessage(rideId, msg);
+  io.to(`ride_${rideId}`).emit('ride_message', msg);
+  io.to(rideId).emit('ride_message', msg);
+  io.to(`ride_${rideId}`).emit('new_message', msg);
+  console.log(`💬 Ride ${rideId} ${from}: ${text}`);
+  res.json({ok:true, delivered:true, message:msg});
+});
+
+app.get('/rides/:id/messages', authenticate, (req, res) => {
+  const rideId = req.params.id;
+  res.json({ride_id: rideId, messages: rideMessages.get(rideId) || []});
+});
 
 // ---- RIDER PAYMENT (for customer app) ----
 app.post('/rider/payment/order', async (req, res) => {
@@ -710,72 +787,5 @@ app.get('/health', (req,res) => {
 });
 app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V55' }));
 
-const rideMessages = new Map(); // in-memory, auto-clears after COMPLETE/CANCEL
-
-function addRideMessage(rideId, msg) {
-  if (!rideMessages.has(rideId)) rideMessages.set(rideId, []);
-  rideMessages.get(rideId).push(msg);
-  // Keep only last 50 per ride
-  if (rideMessages.get(rideId).length > 50) rideMessages.set(rideId, rideMessages.get(rideId).slice(-50));
-}
-
-function clearRideMessages(rideId) {
-  rideMessages.delete(rideId);
-  console.log(`Cleared messages for ${rideId}`);
-}
-
-// Socket: join ride room
-// In your io.on('connection') add:
-io.on('connection', (socket) => {
-  console.log('Socket connected', socket.id);
-  socket.on('join:ride', (rideId) => {
-    const room = typeof rideId === 'string' ? rideId : rideId?.ride_id;
-    if (room) {
-      socket.join(`ride_${room}`);
-      socket.join(room);
-      console.log(`Socket ${socket.id} joined ride_${room}`);
-    }
-  });
-});
-
-// POST /rides/:id/message - driver<->customer in-app chat
-app.post('/rides/:id/message', authenticate, (req, res) => {
-  const rideId = req.params.id;
-  const from = (req.body.from || 'driver').toString().toLowerCase(); // 'driver' or 'customer'
-  const text = (req.body.text || '').toString().trim();
-  if (!text) return res.status(400).json({error: 'text required'});
-  
-  const msg = {
-    ride_id: rideId,
-    from,
-    text,
-    time: new Date().toISOString(),
-  };
-  addRideMessage(rideId, msg);
-  
-  // Emit to both driver and customer in ride room
-  io.to(`ride_${rideId}`).emit('ride_message', msg);
-  io.to(rideId).emit('ride_message', msg);
-  io.to(`ride_${rideId}`).emit('new_message', msg);
-  io.to(rideId).emit('new_message', msg);
-  
-  console.log(`Ride message ${rideId} ${from}: ${text}`);
-  res.json({ok: true, delivered: true, message: msg});
-});
-
-app.get('/rides/:id/messages', authenticate, (req, res) => {
-  const rideId = req.params.id;
-  const msgs = rideMessages.get(rideId) || [];
-  res.json({ride_id: rideId, messages: msgs});
-});
-
-// In your COMPLETE / CANCEL handlers, add clear:
-// After ride status becomes COMPLETED or CANCELLED:
-// clearRideMessages(rideId);
-
-// Example in ride complete endpoint:
-// app.post('/rides/:id/complete', ... ) { ... clearRideMessages(req.params.id); ... }
-// app.post('/rides/:id/cancel', ... ) { ... clearRideMessages(req.params.id); ... }
-
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V54 JWT+URL+PORT FIX - PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V70 MESSAGES IN-APP LIVE - PORT ${PORT}`));
