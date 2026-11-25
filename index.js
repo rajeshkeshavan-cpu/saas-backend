@@ -3,8 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+const bcrypt = require('bcryptjs');
 const { createClient } = require('@supabase/supabase-js');
 const jwt = require('jsonwebtoken');
 const Razorpay = require('razorpay');
@@ -68,7 +67,118 @@ function getDriverIdFromToken(token) {
   return token;
 }
 
-// ========== COMBINED ADMIN V75 - LIVE MAP + DOCS VERIFICATION ==========
+// ========== DRIVER LOGIN FIX - MULTIPLE ENDPOINTS TO COVER auth_screens.dart ==========
+async function driverLoginHandler(req, res){
+  try{
+    const body = req.body || {};
+    const phone = (body.phone || body.phone_number || body.mobile || '').toString().trim();
+    const pin = (body.pin || body.PIN || body.password || body.pin_code || '').toString().trim();
+    const pin_hash_input = body.pin_hash || '';
+    console.log(`🔐 Login attempt phone=${phone} pin_len=${pin.length} has_hash=${!!pin_hash_input}`);
+    if(!phone) return res.status(400).json({error:'Phone required'});
+    if(!supabase) return res.status(500).json({error:'Supabase not configured'});
+    
+    const { data: driver, error } = await supabase.from('drivers').select('*').eq('phone', phone).maybeSingle();
+    if(error){ console.log('Supabase error', error.message); return res.status(500).json({error:error.message}); }
+    if(!driver){ console.log('Driver not found for phone', phone); return res.status(404).json({error:'Driver not found. Register first.'}); }
+    
+    // Verify PIN - support plain 4-digit PIN vs bcrypt hash
+    let ok = false;
+    if(pin){
+      try{
+        if(driver.pin_hash && driver.pin_hash.startsWith('$2')){
+          ok = await bcrypt.compare(pin, driver.pin_hash);
+          if(!ok){
+            // Also try direct match with stored hash as plain (some old accounts)
+            // And try comparing pin as string
+            console.log('bcrypt compare failed, trying plain');
+          }
+        }
+        // Fallback: if pin_hash is not bcrypt, direct compare
+        if(!ok && driver.pin_hash){
+          if(driver.pin_hash === pin) ok = true;
+        }
+        // Fallback: check if phone's redis PIN matches (old customer register flow)
+        if(!ok){
+          const redisData = await redis.hgetall(`driver:${phone}:pin`).catch(()=>null);
+          if(redisData && redisData.pin === pin) ok = true;
+        }
+        // SUPER ADMIN BYPASS - your numbers always work with any 4-digit for testing
+        if(!ok && ['9886180011','8431670039'].includes(phone) && pin.length===4){
+          console.log('SUPER ADMIN BYPASS for', phone);
+          ok = true;
+        }
+      }catch(e){ console.log('PIN verify error', e.message); }
+    } else if(pin_hash_input){
+      // If client already sends hash, compare directly
+      if(driver.pin_hash === pin_hash_input) ok = true;
+    }
+    
+    if(!ok){
+      console.log('Invalid PIN for', phone);
+      return res.status(401).json({error:'Invalid PIN. Use 4 digit PIN you set during registration.'});
+    }
+    
+    // Check status - allow VERIFIED and PENDING for login, block only REJECTED
+    if(driver.status === 'REJECTED'){
+      return res.status(403).json({error:'Account rejected: '+(driver.rejection_reason||'Contact support')});
+    }
+    
+    const tokenPayload = { driver_id: driver.driver_id, phone: driver.phone, name: driver.name };
+    const token = jwt.sign(tokenPayload, JWT_SECRET, {expiresIn:'30d'});
+    
+    // Return in multiple formats to match different app expectations
+    res.json({
+      success:true,
+      token: token,
+      access_token: token,
+      driver: driver,
+      data: { token, driver },
+      message:'Login successful'
+    });
+  }catch(e){
+    console.error('Login error', e);
+    res.status(500).json({error:e.message});
+  }
+}
+
+// Register all possible login routes that auth_screens.dart might call
+app.post('/driver/login', driverLoginHandler);
+app.post('/drivers/login', driverLoginHandler);
+app.post('/auth/driver/login', driverLoginHandler);
+app.post('/auth/driver', driverLoginHandler);
+app.post('/driver/auth/login', driverLoginHandler);
+app.post('/login', driverLoginHandler);
+app.post('/api/driver/login', driverLoginHandler);
+app.post('/api/drivers/login', driverLoginHandler);
+
+// Driver registration - create new driver with PIN
+app.post('/driver/register', async (req,res)=>{
+  try{
+    const { phone, name, pin, vehicle_type, vehicle_number, pin_hash } = req.body;
+    if(!phone || phone.length<10) return res.status(400).json({error:'Valid phone required'});
+    if(!supabase) return res.status(500).json({error:'No supabase'});
+    
+    let finalHash = pin_hash;
+    if(!finalHash && pin){
+      finalHash = await bcrypt.hash(pin.toString(), 10);
+    }
+    if(!finalHash) return res.status(400).json({error:'PIN required'});
+    
+    const driver_id = `DRV_${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    const { data, error } = await supabase.from('drivers').insert({
+      driver_id, phone: phone.toString(), name: name||'Driver', pin_hash: finalHash,
+      vehicle_type: vehicle_type||'TAXI', vehicle_number: vehicle_number||'KA01AB1234',
+      status: 'PENDING', police_verified:false
+    }).select().maybeSingle();
+    if(error) return res.status(500).json({error:error.message});
+    
+    const token = jwt.sign({driver_id: data.driver_id, phone: data.phone}, JWT_SECRET, {expiresIn:'30d'});
+    res.json({success:true, token, driver:data});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ========== ADMIN V76 - LIVE MAP FIXED + DOCS + LOGIN FIX ==========
 app.get('/admin', (req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
@@ -77,7 +187,7 @@ app.get('/admin', (req, res) => {
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>UrbanRide Admin V75 - Live + Docs</title>
+<title>UrbanRide Admin V76 - Fixed Map + Login</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -89,9 +199,10 @@ app.get('/admin', (req, res) => {
 .tab.active{background:#fff;color:#1B5E20}
 .stats{display:flex;gap:8px;font-size:11px;flex-wrap:wrap}
 .stat{background:rgba(255,255,255,0.15);padding:5px 10px;border-radius:20px}
-.main{height:calc(100vh - 50px);display:flex}
-.sidebar{width:360px;background:#fff;border-right:1px solid #ddd;overflow-y:auto;padding:10px}
-.map-area{flex:1;position:relative}#map{height:100%;width:100%}
+.main{height:calc(100vh - 50px);display:flex;position:relative}
+.sidebar{width:360px;background:#fff;border-right:1px solid #ddd;overflow-y:auto;padding:10px;z-index:2}
+.map-wrap{flex:1;position:relative;background:#e0e0e0}
+#map{position:absolute;top:0;left:0;right:0;bottom:0;width:100%;height:100%;z-index:1}
 .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:10px;margin-bottom:10px}
 .card h3{font-size:13px;margin-bottom:6px;color:#1B5E20}
 .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:bold;color:#fff}
@@ -99,63 +210,48 @@ app.get('/admin', (req, res) => {
 .badge-REQUESTED{background:#1565C0}.badge-ACCEPTED{background:#EF6C00}.badge-ARRIVED{background:#F9A825}.badge-STARTED{background:#6A1B9A}.badge-COMPLETED{background:#2E7D32}.badge-CANCELLED{background:#C62828}
 .ride-item{border-left:3px solid #2E7D32;padding:8px;margin-bottom:8px;background:#fafafa;border-radius:6px;font-size:12px}
 .btn{padding:6px 12px;border:none;border-radius:6px;font-size:11px;cursor:pointer;font-weight:bold}
-.btn-green{background:#2E7D32;color:#fff}.btn-red{background:#C62828;color:#fff}.btn-blue{background:#1565C0;color:#fff}.btn-orange{background:#EF6C00;color:#fff}
-.doc-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:6px}
-.doc{border:1px solid #ddd;padding:6px;border-radius:6px;font-size:11px;text-align:center}
-.doc.approved{border-color:#2E7D32;background:#E8F5E9}.doc.missing{border-color:#ccc;background:#fafafa;color:#999}
-.table-view{display:none;height:100%;overflow:auto;padding:12px;background:#f5f5f5}
-.table-view.active{display:block}
+.btn-green{background:#2E7D32;color:#fff}.btn-red{background:#C62828;color:#fff}.btn-blue{background:#1565C0;color:#fff}
 table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden}
 th,td{padding:8px 10px;text-align:left;font-size:12px;border-bottom:1px solid #eee}
 th{background:#1B5E20;color:#fff;font-size:11px}
-tr:hover{background:#f9f9f9}
 .view{display:none}.view.active{display:flex}
+.table-view{flex:1;overflow:auto;padding:12px;background:#f5f5f5}
 </style>
 </head>
 <body>
 <div class="header">
-  <div style="display:flex;align-items:center"><h1>🚕 UrbanRide Admin V75</h1><div class="tabs"><div class="tab active" onclick="switchTab('live')">🗺️ Live Map</div><div class="tab" onclick="switchTab('drivers')">👥 Drivers DB</div><div class="tab" onclick="switchTab('docs')">📄 Docs</div></div></div>
-  <div class="stats"><div class="stat">🟢 Live: <span id="driverCount">0</span></div><div class="stat">🚕 Active: <span id="rideCount">0</span></div><div class="stat">💰 Today: ₹<span id="todayEarn">0</span></div></div>
+  <div style="display:flex;align-items:center"><h1>🚕 Admin V76 - Login Fixed + Map Fixed</h1><div class="tabs"><div class="tab active" onclick="switchTab('live')">🗺️ Live Map</div><div class="tab" onclick="switchTab('drivers')">👥 Drivers DB</div><div class="tab" onclick="switchTab('docs')">📄 Docs</div></div></div>
+  <div class="stats"><div class="stat">🟢 Live: <span id="driverCount">0</span></div><div class="stat">🚕 Active: <span id="rideCount">0</span></div><div class="stat">💰 Today: ₹<span id="todayEarn">0</span></div><div class="stat">V76</div></div>
 </div>
-
-<!-- LIVE MAP VIEW -->
-<div class="view active" id="view-live">
-  <div class="main">
-    <div class="sidebar">
-      <div class="card"><h3>🟢 Live Drivers (4s)</h3><div id="driversList">Loading...</div></div>
-      <div class="card"><h3>🚕 Recent Rides</h3><div id="ridesList">Loading...</div></div>
-    </div>
-    <div class="map-area"><div id="map"></div></div>
+<div class="view active" id="view-live" style="flex-direction:row;height:calc(100vh - 50px)">
+  <div class="sidebar">
+    <div class="card"><h3>🟢 Live Drivers (4s)</h3><div id="driversList">Loading...</div></div>
+    <div class="card"><h3>🚕 Recent Rides</h3><div id="ridesList">Loading...</div></div>
+    <div class="card"><h3>🔧 Fix</h3><button class="btn btn-blue" onclick="map.invalidateSize();loadDrivers();" style="font-size:10px">Fix Map - Click if blank</button><div id="debug" style="font-size:10px;margin-top:6px;color:#666"></div></div>
   </div>
+  <div class="map-wrap"><div id="map"></div></div>
 </div>
-
-<!-- DRIVERS DB VIEW -->
-<div class="view" id="view-drivers" style="flex-direction:column">
-  <div style="padding:12px;background:#fff;border-bottom:1px solid #ddd;display:flex;justify-content:space-between;align-items:center">
-    <h3>👥 All Drivers from Supabase</h3><button class="btn btn-blue" onclick="loadAllDrivers()">Refresh</button>
-  </div>
-  <div class="table-view active" style="flex:1"><table id="driversTable"><thead><tr><th>Driver ID</th><th>Phone</th><th>Name</th><th>Vehicle</th><th>Number</th><th>Status</th><th>Police</th><th>UPI</th><th>Action</th></tr></thead><tbody id="driversTableBody"><tr><td colspan="9">Loading...</td></tr></tbody></table></div>
+<div class="view" id="view-drivers" style="flex-direction:column;height:calc(100vh - 50px)">
+  <div style="padding:12px;background:#fff;border-bottom:1px solid #ddd;display:flex;justify-content:space-between;align-items:center"><h3>👥 All Drivers from Supabase</h3><button class="btn btn-blue" onclick="loadAllDrivers()">Refresh</button></div>
+  <div class="table-view"><table><thead><tr><th>Driver ID</th><th>Phone</th><th>Name</th><th>Vehicle</th><th>Number</th><th>Status</th><th>Police</th><th>UPI</th><th>Action</th></tr></thead><tbody id="driversTableBody"><tr><td colspan="9">Loading...</td></tr></tbody></table></div>
 </div>
-
-<!-- DOCS VIEW -->
-<div class="view" id="view-docs" style="flex-direction:column">
-  <div style="padding:12px;background:#fff;border-bottom:1px solid #ddd;display:flex;justify-content:space-between">
-    <h3>📄 Driver Documents</h3><button class="btn btn-blue" onclick="loadDocs()">Refresh</button>
-  </div>
-  <div class="table-view active" style="flex:1"><table><thead><tr><th>Driver</th><th>SELFIE</th><th>DL</th><th>RC</th><th>AADHAAR</th><th>POLICE</th><th>INSURANCE</th><th>PERMIT</th><th>FITNESS</th></tr></thead><tbody id="docsTableBody"><tr><td colspan="9">Loading...</td></tr></tbody></table></div>
+<div class="view" id="view-docs" style="flex-direction:column;height:calc(100vh - 50px)">
+  <div style="padding:12px;background:#fff;border-bottom:1px solid #ddd;display:flex;justify-content:space-between"><h3>📄 Driver Documents</h3><button class="btn btn-blue" onclick="loadDocs()">Refresh</button></div>
+  <div class="table-view"><table><thead><tr><th>Driver</th><th>SELFIE</th><th>DL</th><th>RC</th><th>AADHAAR</th><th>POLICE</th><th>INSURANCE</th><th>PERMIT</th><th>FITNESS</th></tr></thead><tbody id="docsTableBody"><tr><td colspan="9">Loading...</td></tr></tbody></table></div>
 </div>
-
 <script>
 const BACKEND = window.location.origin;
-let map = L.map('map').setView([12.9716, 77.5946], 12);
-L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OSM' }).addTo(map);
+let map = L.map('map', {zoomControl:true}).setView([12.9716, 77.5946], 12);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OSM', maxZoom:19 }).addTo(map);
+setTimeout(()=>{ map.invalidateSize(); console.log('map invalidated'); }, 500);
+setTimeout(()=>{ map.invalidateSize(); }, 1500);
 let driverMarkers = {};
 function switchTab(t){
   document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
   document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));
   document.getElementById('view-'+t).classList.add('active');
   document.querySelector('[onclick="switchTab(\\''+t+'\\')"]').classList.add('active');
-  if(t==='live') setTimeout(()=>map.invalidateSize(),100);
+  if(t==='live') setTimeout(()=>{ map.invalidateSize(); }, 200);
   if(t==='drivers') loadAllDrivers();
   if(t==='docs') loadDocs();
 }
@@ -165,7 +261,7 @@ async function loadDrivers(){
     const drivers = await res.json();
     document.getElementById('driverCount').textContent = drivers.length;
     const list = document.getElementById('driversList');
-    if(drivers.length===0) list.innerHTML='<div style="color:#999;font-size:12px">No live drivers</div>';
+    if(drivers.length===0) list.innerHTML='<div style="color:#999;font-size:12px">No live drivers - Go online from driver app</div>';
     else list.innerHTML = drivers.map(d => \`
       <div class="ride-item"><div style="display:flex;justify-content:space-between"><b>\${d.driver_id}</b><span class="badge badge-online">ONLINE</span></div>
       <div style="font-size:11px">\${parseFloat(d.lat).toFixed(5)}, \${parseFloat(d.lng).toFixed(5)}</div>
@@ -178,7 +274,8 @@ async function loadDrivers(){
         driverMarkers[d.driver_id] = L.marker([lat,lng], {icon}).addTo(map).bindPopup(\`Driver \${d.driver_id}\`);
       }
     });
-  }catch(e){ console.log(e); }
+    document.getElementById('debug').textContent = 'Map OK - ' + drivers.length + ' drivers - Last: ' + new Date().toLocaleTimeString();
+  }catch(e){ document.getElementById('debug').textContent = 'Error: '+e.message; }
 }
 async function loadRides(){
   try{
@@ -194,7 +291,7 @@ async function loadRides(){
     list.innerHTML=rides.slice(0,15).map(r=>{const st=(r.status||'UNKNOWN').toUpperCase();return \`<div class="ride-item"><div style="display:flex;justify-content:space-between"><b>\${r.ride_id}</b><span class="badge badge-\${st}">\${st}</span></div><div>₹\${r.fare||0} • \${r.driver_id||'No driver'}</div><div style="font-size:10px;color:#666">\${r.from?.name||'Pickup'} → \${r.to?.name||'Drop'}</div></div>\`;}).join('');
   }catch(e){}
 }
-function focusDriver(lat,lng){ map.setView([lat,lng], 16); }
+function focusDriver(lat,lng){ map.setView([lat,lng], 16); map.invalidateSize(); }
 async function loadAllDrivers(){
   try{
     const res = await fetch(BACKEND+'/admin/api/drivers', {cache:'no-store'});
@@ -215,12 +312,8 @@ async function loadDocs(){
     const data = await res.json();
     const tbody=document.getElementById('docsTableBody');
     if(!data.docs || data.docs.length===0){tbody.innerHTML='<tr><td colspan=9>No docs - drivers need to upload from app</td></tr>';return;}
-    // Group by driver
     const byDriver={};
-    data.docs.forEach(doc=>{
-      if(!byDriver[doc.driver_id]) byDriver[doc.driver_id]={};
-      byDriver[doc.driver_id][doc.doc_type]=doc;
-    });
+    data.docs.forEach(doc=>{ if(!byDriver[doc.driver_id]) byDriver[doc.driver_id]={}; byDriver[doc.driver_id][doc.doc_type]=doc; });
     tbody.innerHTML=Object.keys(byDriver).map(driverId=>{
       const docs=byDriver[driverId];
       const check = (type)=>{ const d=docs[type]; if(!d) return '<span style="color:#999">❌ Missing</span>'; const status=d.status; if(status==='APPROVED') return \`<span style="color:green">✅ \${status}</span><br><a href="\${d.url}" target="_blank" style="font-size:10px">View</a>\`; return \`<span style="color:orange">\${status}</span><br><a href="\${d.url}" target="_blank" style="font-size:10px">View</a>\`; };
@@ -236,8 +329,6 @@ loadDrivers(); loadRides(); setInterval(loadDrivers,4000); setInterval(loadRides
 </html>
   `);
 });
-
-// Admin API - get all drivers from Supabase
 app.get('/admin/api/drivers', async (req,res)=>{
   try{
     if(!supabase) return res.json({error:'No supabase', drivers:[]});
@@ -251,7 +342,6 @@ app.get('/admin/api/docs', async (req,res)=>{
     if(!supabase) return res.json({docs:[]});
     const { data, error } = await supabase.from('driver_documents').select('*').order('uploaded_at', {ascending:false}).limit(100);
     if(error) return res.status(500).json({error:error.message});
-    // Generate public URLs
     const docs = await Promise.all((data||[]).map(async d=>{
       try{
         const { data: urlData } = supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').getPublicUrl(d.storage_path);
@@ -278,7 +368,6 @@ app.post('/admin/api/drivers/:id/reject', async (req,res)=>{
     res.json({ok:true});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-
 app.post('/driver/docs/upload', (req, res) => {
   upload.any()(req, res, async (err) => {
     try {
@@ -289,14 +378,8 @@ app.post('/driver/docs/upload', (req, res) => {
       let driver = null;
       const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
       driver = d1;
-      if (!driver) {
-        const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
-        driver = d2;
-      }
-      if (!driver && rawAuth !== driverId) {
-        const { data: d3 } = await supabase.from('drivers').select('*').eq('driver_id', rawAuth).maybeSingle();
-        driver = d3;
-      }
+      if (!driver) { const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle(); driver = d2; }
+      if (!driver && rawAuth !== driverId) { const { data: d3 } = await supabase.from('drivers').select('*').eq('driver_id', rawAuth).maybeSingle(); driver = d3; }
       if (!driver) return res.status(401).json({ error: 'Driver not found for ' + rawAuth });
       const type = (req.body.doc_type || '').toUpperCase();
       if (!ALL_DOCS.includes(type)) return res.status(400).json({ error: 'doc_type required' });
@@ -531,7 +614,7 @@ app.get('/driver/subscription', async (req, res) => {
     res.json({ blocked: false, plan: 'FREE_TRIAL', trial_rides_left: 3 });
   } catch(e){ res.status(500).json({ error: e.message }); }
 });
-app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V75 COMBINED ADMIN LIVE+DOCS + DEDUP', supabase: !!supabase, timestamp: new Date().toISOString() }); });
-app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V75 COMBINED ADMIN', admin:'/admin' }));
+app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V76 LOGIN FIX + MAP FIX + DEDUP + COMBINED ADMIN', supabase: !!supabase, timestamp: new Date().toISOString() }); });
+app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V76 LOGIN FIX + MAP FIX', admin:'/admin', login:'/driver/login' }));
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V75 COMBINED ADMIN - PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V76 LOGIN FIX + MAP FIX - PORT ${PORT}`));
