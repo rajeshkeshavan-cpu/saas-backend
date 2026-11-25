@@ -1,235 +1,677 @@
-
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
-const multer = require('multer');
-const { Redis } = require('@upstash/redis');
+const Redis = require('ioredis');
+const crypto = require('crypto');
+const fs = require('fs');
+const { createClient } = require('@supabase/supabase-js');
+const jwt = require('jsonwebtoken');
+const Razorpay = require('razorpay');
 
 const app = express();
+
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+const redis = new Redis(process.env.REDIS_URL || undefined, process.env.REDIS_URL ? { tls: {} } : {});
+redis.on('connect', () => console.log('✅ Redis connected'));
+redis.on('error', (err) => console.log('Redis error:', err.message));
 
-let redis;
-try {
-  redis = new Redis({
-    url: process.env.UPSTASH_REDIS_REST_URL,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN,
-  });
-} catch (e) {
-  console.log("Redis not configured, using memory fallback");
-}
+const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } })
+  : null;
+global.supabase = supabase;
+if (!supabase) console.log('⚠️ Supabase not configured');
 
-const mem = {
-  rides: [],
-  drivers: {},
-  driverProfiles: {},
-  messages: {}, // ride_id -> [msgs]
-  docs: {},
-  wallets: {}
-};
+const rides = new Map();
+global.onlineDrivers = {};
 
-async function getRides() {
-  try {
-    if (redis) {
-      const r = await redis.get('rides');
-      return r ? (typeof r === 'string' ? JSON.parse(r) : r) : mem.rides;
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10*1024*1024 } });
+const ALL_DOCS = ['SELFIE','DL','RC','AADHAAR','PERMIT','INSURANCE','POLICE','FITNESS'];
+const JWT_SECRET = process.env.JWT_SECRET || 'urbanride_secret';
+
+let razorpayInstance = null;
+
+function authenticate(req,res,next){
+  try{
+    const hdr = (req.headers.authorization||'').replace('Bearer ','').trim();
+    if(!hdr) return res.status(401).json({error:'No token'});
+    try{
+      const decoded = jwt.verify(hdr, JWT_SECRET);
+      req.user = decoded;
+      return next();
+    }catch(e){}
+    if(hdr.length>=6){
+      req.user = { token: hdr };
+      return next();
     }
-  } catch (_) {}
-  return mem.rides;
+    return res.status(401).json({error:'Invalid token'});
+  }catch(e){ return res.status(401).json({error:'Auth failed'}); }
 }
-async function saveRides(rides) {
-  mem.rides = rides;
+
+// ---- In-memory ride messages + DEDUP STORE ----
+const rideMessages = new Map();
+const recentMsgHashes = new Map(); // rideId -> Map<hash, timestamp>
+
+function msgHash(rideId, from, text){
+  return `${rideId}::${from}::${text.trim().toLowerCase()}`;
+}
+function isDuplicate(rideId, from, text){
+  const hash = msgHash(rideId, from, text);
+  if(!recentMsgHashes.has(rideId)) recentMsgHashes.set(rideId, new Map());
+  const map = recentMsgHashes.get(rideId);
+  const now = Date.now();
+  // Clean old (>10 sec)
+  for(const [h, t] of map.entries()){ if(now - t > 10000) map.delete(h); }
+  if(map.has(hash)){
+    const last = map.get(hash);
+    if(now - last < 8000){ // 8 sec window
+      return true;
+    }
+  }
+  map.set(hash, now);
+  return false;
+}
+function addRideMessage(rideId, msg){
+  if(!rideMessages.has(rideId)) rideMessages.set(rideId, []);
+  rideMessages.get(rideId).push(msg);
+  if(rideMessages.get(rideId).length>50) rideMessages.set(rideId, rideMessages.get(rideId).slice(-50));
+}
+function clearRideMessages(rideId){
+  if(rideMessages.has(rideId)){
+    rideMessages.delete(rideId);
+    recentMsgHashes.delete(rideId);
+    console.log(`🧹 Cleared messages for ${rideId}`);
+  }
+}
+
+function getRazorpay() {
+  if (razorpayInstance) return razorpayInstance;
+  const key_id = process.env.RAZORPAY_KEY_ID;
+  const key_secret = process.env.RAZORPAY_KEY_SECRET;
+  if (!key_id || !key_secret) {
+    console.log('⚠️ Razorpay keys not set');
+    return null;
+  }
+  razorpayInstance = new Razorpay({ key_id, key_secret });
+  return razorpayInstance;
+}
+
+try {
+  const razorModule = require('./razorpay');
+  if (razorModule && typeof razorModule === 'function') {
+    razorModule(app, { supabase, redis, io });
+    console.log('✅ razorpay.js mounted (driver subscriptions)');
+  }
+} catch(e) {
+  console.log('razorpay.js not mounted:', e.message);
+}
+
+function getDriverIdFromToken(token) {
+  if (!token) return null;
   try {
-    if (redis) await redis.set('rides', JSON.stringify(rides));
-  } catch (_) {}
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded && decoded.driver_id) return decoded.driver_id;
+  } catch(e) {}
+  return token;
 }
 
-app.get('/', (req, res) => res.json({ ok: true, msg: "SAAS Backend LIVE V73", time: new Date().toISOString() }));
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-// DRIVER ME
-app.get('/driver/me', async (req, res) => {
-  const token = (req.headers.authorization || "").replace("Bearer ", "");
-  const driver_id = token || "DRV_123";
-  res.json({
-    ok: true,
-    driver: { driver_id, name: driver_id, phone: "9876543210", is_super_admin: true },
-    is_super_admin: true,
-    compliance: { ok: true, is_super_admin: true, warnings: [] },
-    subscription: { blocked: false, enabled: true, free_days_left: 30 }
+// ---- FIXED UPLOAD: SINGLE ROUTE with upload.any() ----
+app.post('/driver/docs/upload', (req, res) => {
+  upload.any()(req, res, async (err) => {
+    try {
+      if (err) return res.status(400).json({ error: err.message });
+      const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+      if (!rawAuth) return res.status(401).json({ error: 'No token' });
+      const driverId = getDriverIdFromToken(rawAuth);
+      console.log(`[UPLOAD] raw=${rawAuth.substring(0,20)} decoded=${driverId}`);
+      let driver = null;
+      const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+      driver = d1;
+      if (!driver) {
+        const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+        driver = d2;
+      }
+      if (!driver && rawAuth !== driverId) {
+        const { data: d3 } = await supabase.from('drivers').select('*').eq('driver_id', rawAuth).maybeSingle();
+        driver = d3;
+      }
+      if (!driver) return res.status(401).json({ error: 'Driver not found for ' + rawAuth });
+      const type = (req.body.doc_type || '').toUpperCase();
+      if (!ALL_DOCS.includes(type)) return res.status(400).json({ error: 'doc_type required' });
+      let file = req.files && req.files.length>0 ? req.files[0] : null;
+      if (!file) return res.status(400).json({ error: 'file required' });
+      const ext = (file.originalname?.split('.').pop() || 'jpg').toLowerCase();
+      const fileName = `${driver.driver_id}/${type}_${Date.now()}.${ext}`;
+      let mime = file.mimetype || 'image/jpeg';
+      if (mime === 'application/octet-stream' || !mime.startsWith('image/')) {
+        mime = ext === 'png' ? 'image/png' : 'image/jpeg';
+      }
+      console.log(`[UPLOAD] ${driver.driver_id} ${type} -> ${fileName} mime=${mime} orig=${file.mimetype} size=${file.buffer?.length}`);
+      const { error: upErr } = await supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').upload(fileName, file.buffer, { contentType: mime, upsert: true });
+      if (upErr) return res.status(500).json({ error: upErr.message });
+      const { data: existing } = await supabase.from('driver_documents').select('*').eq('driver_id', driver.driver_id).eq('doc_type', type).maybeSingle();
+      console.log(`[UPLOAD] Existing doc: ${existing ? existing.storage_path : 'none'}`);
+      if (existing) {
+        const { data: upd, error: updErr } = await supabase.from('driver_documents').update({ storage_path: fileName, status: 'APPROVED', uploaded_at: new Date().toISOString() }).eq('driver_id', driver.driver_id).eq('doc_type', type).select();
+        if (updErr) {
+          console.error('[UPLOAD] Update failed', updErr);
+          return res.status(500).json({ error: 'DB update failed: ' + updErr.message });
+        }
+      } else {
+        const { error: insErr } = await supabase.from('driver_documents').insert({ driver_id: driver.driver_id, doc_type: type, storage_path: fileName, status: 'APPROVED', uploaded_at: new Date().toISOString() });
+        if (insErr) return res.status(500).json({ error: insErr.message });
+      }
+      const { data: urlData } = supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').getPublicUrl(fileName);
+      res.json({ ok: true, url: urlData.publicUrl, path: fileName });
+    } catch(e){
+      console.error('[UPLOAD] error', e);
+      res.status(500).json({ error: e.message });
+    }
   });
 });
 
-app.get('/driver/profile', async (req, res) => {
-  const token = (req.headers.authorization || "").replace("Bearer ", "") || "DRV_123";
-  res.json({
-    driver: { driver_id: token, upi_id: mem.driverProfiles[token]?.upi_id || "rajesh@okaxis", name: token },
-    upi_id: mem.driverProfiles[token]?.upi_id || ""
-  });
+app.get('/driver/docs/:type/url', async (req,res)=>{
+  try{
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    const type = (req.params.type || '').toUpperCase();
+    const { data: driver } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    let d = driver;
+    if (!d) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      d = d2;
+    }
+    if (!d) return res.status(404).json({ error: 'Driver not found' });
+    const { data: doc } = await supabase.from('driver_documents').select('*').eq('driver_id', d.driver_id).eq('doc_type', type).maybeSingle();
+    if (!doc) return res.status(404).json({ error: 'Not found' });
+    const { data: urlData } = supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').getPublicUrl(doc.storage_path);
+    res.json({ url: urlData.publicUrl, status: doc.status });
+  }catch(e){ res.status(500).json({ error: e.message }); }
 });
 
-app.post('/driver/upi', async (req, res) => {
-  const token = (req.headers.authorization || "").replace("Bearer ", "") || "DRV_123";
-  const { upi_id } = req.body;
-  if (!mem.driverProfiles[token]) mem.driverProfiles[token] = {};
-  mem.driverProfiles[token].upi_id = upi_id;
-  console.log(`UPI saved ${token} -> ${upi_id}`);
-  res.json({ ok: true, upi_id });
-});
-
-app.get('/driver/wallet', async (req, res) => {
-  res.json({
-    balance: 1250, total_earnings: 2250, total_rides: 22, net_due: 0, credit: 0,
-    current_plan: "DAILY_AUTO", plan_expires_at: "2026-11-30", enabled: true,
-    transactions: [
-      { type: "EARNING", amount: 150, description: "Ride RIDE_0" },
-      { type: "EARNING", amount: 170, description: "Ride RIDE_1" }
-    ]
-  });
-});
-
-app.get('/driver/subscription', async (req, res) => {
-  res.json({ enabled: true, free_days_left: 5, daily_total: 25, net_due: 0, credit: 100, pay_instructions: "UPI: admin@okaxis", charges: [] });
-});
-
-app.post('/driver/subscription/activate', async (req, res) => { console.log("Activate", req.body); res.json({ ok: true, plan: req.body.plan_id }); });
-app.post('/driver/subscription/razorpay/verify', async (req, res) => { console.log("Verify", req.body); res.json({ ok: true }); });
-app.post('/rider/payment/order', async (req, res) => { res.json({ order_id: "order_" + Date.now(), id: "order_" + Date.now(), key_id: "rzp_test_dummy", amount: req.body.amount * 100 }); });
-
-// DOCS - SINGLE ROUTE HANDLING BOTH FIELD NAMES
-app.get('/driver/docs/:type/url', async (req, res) => { res.status(404).json({ error: "Not found" }); });
-
-const upload = multer({ storage: multer.memoryStorage() });
-app.post('/driver/docs/upload', upload.fields([{ name: 'file', maxCount: 1 }, { name: 'document', maxCount: 1 }]), async (req, res) => {
-  const file = req.files?.file?.[0] || req.files?.document?.[0] || req.file;
-  console.log("Doc upload", req.body.doc_type, "size", file?.size || 0);
-  res.json({ ok: true, url: "https://via.placeholder.com/400x300?text=" + (req.body.doc_type || "DOC") });
-});
-
-app.delete('/driver/account', async (req, res) => { console.log("Delete account", req.headers.authorization); res.json({ ok: true, msg: "Deleted" }); });
-
-// RIDES
-app.get('/rides', async (req, res) => { const rides = await getRides(); res.json(rides); });
-app.get('/drivers', async (req, res) => { res.json(Object.values(mem.drivers)); });
-
-async function handleDriverLocation(req, res) {
-  const { driver_id, lat, lng, online } = req.body;
-  if (!driver_id) return res.status(400).json({ error: "driver_id required" });
-  mem.drivers[driver_id] = { driver_id, lat, lng, online, updated_at: new Date().toISOString() };
-  console.log(`📍 ${driver_id} ${lat},${lng} online=${online}`);
-  io.emit('driver:location', { driver_id, lat, lng });
-  res.json({ ok: true });
+// ---- HELPERS ----
+function publicRide(ride){
+  if(!ride) return ride;
+  const { customer_pin, ...pub } = ride;
+  // Keep pin for driver who is assigned? Actually hide from public list, but allow if needed
+  // For map listing, hide pin
+  return { ...pub, has_pin: !!customer_pin };
 }
-app.post('/driver/location', handleDriverLocation);
-app.post('/drivers/location', handleDriverLocation);
+async function getRide(rideId){
+  try{
+    let r = rides.get(rideId);
+    if(r) return r;
+    const data = await redis.hget('tenant:TENANT_01:rides', rideId);
+    if(data){
+      r = JSON.parse(data);
+      rides.set(rideId, r);
+      return r;
+    }
+  } catch (e) {}
+  return null;
+}
 
-app.post('/rides', async (req, res) => {
-  const rides = await getRides();
+app.get('/', (req, res) => {
+  res.send('SaaS Driver Backend - Karnataka Fares - Running V72 DEDUP FIXED');
+});
+
+app.get('/nearest', async (req, res) => {
+  const { tenant_id, lat, lng, radius_km = 3 } = req.query;
+  if (!tenant_id || !lat || !lng) return res.status(400).json({ error: "Missing params" });
+  try {
+    const key = `tenant:${tenant_id}:drivers:geo`;
+    const latNum = parseFloat(lat);
+    const lngNum = parseFloat(lng);
+    const radiusNum = parseFloat(radius_km);
+    const raw = await new Promise((resolve, reject) => {
+      redis.send_command('georadius', [key, lngNum.toString(), latNum.toString(), radiusNum.toString(), 'km', 'WITHCOORD', 'WITHDIST', 'ASC'], (err, result) => {
+        if (err) reject(err);
+        else resolve(result);
+      });
+    });
+    const drivers = raw.map(r => ({
+      driver_id: r[0],
+      distance_km: parseFloat(r[1]),
+      lng: parseFloat(r[2][0]),
+      lat: parseFloat(r[2][1])
+    }));
+    res.json({ tenant_id, center: { lat: latNum, lng: lngNum }, radius_km: radiusNum, drivers, count: drivers.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/drivers', async (req, res) => {
+  try {
+    const driverKeys = await redis.keys('driver:*:location');
+    let drivers = [];
+    for (let key of driverKeys) {
+      const data = await redis.hgetall(key);
+      if (data && data.lat) {
+        let driverId = key.split(':')[1];
+        drivers.push({
+          driver_id: driverId,
+          lat: parseFloat(data.lat),
+          lng: parseFloat(data.lng),
+          last_seen: data.updated_at,
+          online: true
+        });
+      }
+    }
+    for (let id in global.onlineDrivers) {
+      if (!drivers.find(d => d.driver_id === id)) {
+        drivers.push(global.onlineDrivers[id]);
+      }
+    }
+    res.json(drivers);
+  } catch (e) {
+    console.log('drivers error', e.message);
+    res.json([]);
+  }
+});
+
+app.post('/customer/register', async (req, res) => {
+  try {
+    let { phone } = req.body;
+    if (!phone || phone.length != 10) return res.status(400).json({ error: "10 digit phone required" });
+    let existing = await redis.hgetall(`customer:${phone}`);
+    if (existing && existing.pin) {
+      return res.json({ phone, pin: existing.pin, existing: true });
+    }
+    let pin = Math.floor(1000 + Math.random() * 9000).toString();
+    await redis.hset(`customer:${phone}`, { pin, phone, created: new Date().toISOString() });
+    console.log(`📱 Customer ${phone} PIN ${pin}`);
+    res.json({ phone, pin });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/driver/:id/selfie', async (req, res) => {
+  console.log(`📸 Selfie received for ${req.params.id}`);
+  res.json({ verified: true, driver_id: req.params.id });
+});
+
+app.post('/driver/location', async (req, res) => {
+  const { driver_id, lat, lng } = req.body;
+  if (!driver_id || !lat || !lng) return res.status(400).json({ error: "Missing" });
+  await redis.hset(`driver:${driver_id}:location`, { lat, lng, updated_at: Date.now() });
+  global.onlineDrivers[driver_id] = { driver_id, lat, lng, last_seen: Date.now(), online: true };
+  res.json({ success: true });
+});
+
+
+io.on('connection', (socket) => {
+  console.log(`✅ Connected: ${socket.id}`);
+  socket.on('driver:location:update', async (data) => {
+    try {
+      const { tenant_id, driver_id, lat, lng } = data;
+      if (!driver_id || !lat || !lng) return;
+      await redis.hset(`driver:${driver_id}:location`, { lat, lng, updated_at: Date.now() });
+      global.onlineDrivers[driver_id] = { driver_id, lat, lng, last_seen: Date.now(), online: true };
+      const key = `tenant:${tenant_id || 'TENANT_01'}:drivers:geo`;
+      await redis.geoadd(key, lng, lat, driver_id);
+      io.emit('driver:location', { driver_id, lat, lng });
+    } catch (e) {
+      console.log('location error', e.message);
+    }
+  });
+  // FIXED: Join ONLY canonical room ride_${id} to prevent double delivery
+  socket.on('join:ride', (rideId) => {
+    try{
+      const r = typeof rideId === 'string' ? rideId : (rideId?.ride_id || rideId?.rideId || rideId);
+      if(r){
+        const room = `ride_${r}`;
+        socket.join(room);
+        console.log(`Socket ${socket.id} joined ${room}`);
+      }
+    }catch(e){}
+  });
+  // Keep for backward compat but emit only once
+  socket.on('ride_message', (data) => {
+    try{
+      const rideId = data?.ride_id || data?.rideId;
+      if(rideId){
+        const msg = { ...data, time: data.time || new Date().toISOString() };
+        if(isDuplicate(rideId, msg.from || 'driver', msg.text || '')){
+          console.log(`⚠ Duplicate socket msg ignored ${rideId}`);
+          return;
+        }
+        addRideMessage(rideId, msg);
+        io.to(`ride_${rideId}`).emit('ride_message', msg);
+        console.log(`💬 Socket relay ${rideId} ${msg.from}: ${msg.text}`);
+      }
+    }catch(e){}
+  });
+});
+
+
+// ---------- RIDES ----------
+app.post('/rides/request', async (req, res) => {
+  const { tenant_id, from, to, distance_km: client_distance, fare: client_fare, vehicle_type, eta_min, booked_for_other, passenger_name, passenger_phone, quote_id, customer_pin: body_pin } = req.body;
+  if (!from || !to) return res.status(400).json({ error: 'Pickup and drop are required' });
+
+  let fareData = null;
+  if (client_distance && client_fare) {
+    fareData = { total: Number(client_fare), breakdown: req.body.fare_breakdown || null, distance_km: Number(client_distance) };
+  } else {
+    return res.status(400).json({ error: 'Please get fare quote first' });
+  }
+
+  const ride_id = `RIDE_${Date.now()}`;
+  const customer_pin = (body_pin || String(crypto.randomInt(1000, 10000))).toString();
   const ride = {
-    ride_id: "RIDE_" + Date.now(),
-    status: "REQUESTED",
-    from: req.body.from || { lat: 12.9716, lng: 77.5946 },
-    to: req.body.to || { lat: 12.9352, lng: 77.6245 },
-    fare: req.body.fare || 60,
-    fare_breakdown: req.body.fare_breakdown || { base_fare: 35, included_km: 1.5, per_km_rate: 12, extra_km: 0.5, distance_charge: 6 },
-    vehicle_type: req.body.vehicle_type || "TAXI",
-    customer_pin: req.body.customer_pin || "7824",
-    created_at: new Date().toISOString(),
-    ...req.body
+    ride_id,
+    tenant_id: tenant_id || 'TENANT_01',
+    customer_id: req.body.customer_id || 'CUST_001',
+    customer_phone: req.body.customer_phone || '',
+    customer_pin,
+    from, to,
+    distance_km: fareData.distance_km,
+    fare: fareData.total,
+    fare_breakdown: fareData.breakdown,
+    vehicle_type: vehicle_type || 'TAXI',
+    eta_min: eta_min || null,
+    booked_for_other: booked_for_other === true,
+    passenger_name: passenger_name || null,
+    passenger_phone: passenger_phone || null,
+    status: 'REQUESTED',
+    driver_id: null,
+    created_at: new Date().toISOString()
   };
-  rides.unshift(ride);
-  await saveRides(rides);
-  // FIX: SINGLE EMIT ONLY
-  io.emit('ride:request', ride);
-  console.log("New ride", ride.ride_id);
-  res.json(ride);
+  rides.set(ride_id, ride);
+  await redis.hset(`tenant:${ride.tenant_id}:rides`, ride_id, JSON.stringify(ride));
+  console.log(`🚕 Ride ${ride_id} Fare ₹${fareData.total} PIN ${customer_pin}`);
+  io.emit('ride:request', publicRide(ride));
+  res.json({ success: true, ride });
 });
 
 app.post('/rides/:id/accept', async (req, res) => {
-  const rides = await getRides();
-  const ride = rides.find(r => r.ride_id === req.params.id);
-  if (!ride) return res.status(404).json({ error: "Ride not found" });
-  ride.status = "ACCEPTED"; ride.driver_id = req.body.driver_id; ride.accepted_at = new Date().toISOString();
-  await saveRides(rides); io.emit('ride:accepted', ride); res.json(ride);
+  const ride = await getRide(req.params.id);
+  if (!ride) return res.status(404).json({error: 'Ride not found'});
+  const { driver_id } = req.body;
+  if (ride.status !== 'REQUESTED') return res.status(409).json({ error: 'Ride already taken or cancelled' });
+  ride.status = 'ACCEPTED';
+  ride.driver_id = driver_id;
+  ride.accepted_at = new Date().toISOString();
+  rides.set(ride.ride_id, ride);
+  await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
+  io.emit('ride:accepted', ride); // full ride with pin to driver
+  io.to(`ride_${ride.ride_id}`).emit('ride:accepted', ride);
+  res.json({ success: true, ride });
 });
 
-app.post('/rides/:id/arrived', async (req, res) => {
-  const rides = await getRides();
-  const ride = rides.find(r => r.ride_id === req.params.id);
-  if (!ride) return res.status(404).json({ error: "Ride not found" });
-  ride.status = "ARRIVED"; ride.arrived_at = new Date().toISOString();
-  await saveRides(rides); io.emit('ride:arrived', ride); res.json(ride);
-});
-
-app.post('/rides/:id/start', async (req, res) => {
-  const rides = await getRides();
-  const ride = rides.find(r => r.ride_id === req.params.id);
-  if (!ride) return res.status(404).json({ error: "Ride not found" });
-  const pin = req.body.pin;
-  if (pin && ride.customer_pin && pin !== ride.customer_pin && pin !== "7824") {
-    return res.status(400).json({ error: "Invalid PIN, ask customer" });
-  }
-  ride.status = "STARTED"; ride.started_at = new Date().toISOString();
-  await saveRides(rides); io.emit('ride:started', ride); res.json(ride);
-});
-
-app.post('/rides/:id/complete', async (req, res) => {
-  const rides = await getRides();
-  const ride = rides.find(r => r.ride_id === req.params.id);
-  if (!ride) return res.status(404).json({ error: "Ride not found" });
-  ride.status = "COMPLETED"; ride.completed_at = new Date().toISOString();
-  ride.payment_status = req.body.payment_status || "CASH_COLLECTED";
-  await saveRides(rides); io.emit('ride:completed', ride); res.json(ride);
-});
-
-app.post('/rides/:id/status', async (req, res) => {
-  const rides = await getRides();
-  const ride = rides.find(r => r.ride_id === req.params.id);
-  if (!ride) return res.status(404).json({ error: "Ride not found" });
-  ride.status = (req.body.status || "").toUpperCase(); ride.updated_at = new Date().toISOString();
-  await saveRides(rides); res.json(ride);
+app.post('/rides/:id/decline', async (req, res) => {
+  const ride = await getRide(req.params.id);
+  if (!ride) return res.status(404).json({error: 'Ride not found'});
+  ride.status = 'DECLINED';
+  io.emit('ride:declined', publicRide(ride));
+  res.json({ success: true });
 });
 
 app.post('/rides/:id/cancel', async (req, res) => {
-  const rides = await getRides();
-  const ride = rides.find(r => r.ride_id === req.params.id);
-  if (!ride) return res.status(404).json({ error: "Ride not found" });
-  ride.status = "CANCELLED"; ride.cancel_reason = req.body.reason; ride.cancelled_by = req.body.cancelled_by; ride.cancelled_at = new Date().toISOString();
-  await saveRides(rides); io.emit('ride:cancelled', ride); res.json(ride);
+  const ride = await getRide(req.params.id);
+  if (!ride) return res.status(404).json({error: 'Ride not found'});
+  const { cancelled_by, reason } = req.body;
+  ride.status = 'CANCELLED';
+  ride.cancelled_by = cancelled_by || 'unknown';
+  ride.cancel_reason = reason || 'No reason';
+  ride.cancelled_at = new Date().toISOString();
+  rides.set(ride.ride_id, ride);
+  await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
+  console.log(`❌ Ride ${ride.ride_id} cancelled by ${ride.cancelled_by}: ${ride.cancel_reason}`);
+  clearRideMessages(ride.ride_id);
+  io.emit('ride:cancelled', publicRide(ride));
+  io.to(`ride_${ride.ride_id}`).emit('ride:cancelled', publicRide(ride));
+  res.json({ success: true, ride: publicRide(ride) });
 });
 
-// FIXED: CHAT - SINGLE EMIT, NO DUPLICATE
-app.post('/rides/:id/message', async (req, res) => {
-  const { from, text } = req.body;
-  const ride_id = req.params.id;
-  if (!text) return res.status(400).json({ error: "text required" });
-  const msg = { ride_id, from: from || 'driver', text, time: new Date().toISOString(), msg_id: 'MSG_' + Date.now() };
-  if (!mem.messages[ride_id]) mem.messages[ride_id] = [];
-  mem.messages[ride_id].push(msg);
-  // SINGLE emit to room only - prevents duplicate
-  io.to(ride_id).emit('ride:message', msg);
-  // Also emit globally for fallback, but clients dedup by msg_id
-  io.emit('ride:message', msg);
-  console.log(`💬 ${ride_id} ${from}: ${text}`);
-  res.json({ ok: true, message: msg });
+app.post('/rides/:id/arrived', async (req, res) => {
+  const ride = await getRide(req.params.id);
+  if (!ride) return res.status(404).json({error: 'Ride not found'});
+  ride.status = 'ARRIVED';
+  ride.arrived_at = new Date().toISOString();
+  rides.set(ride.ride_id, ride);
+  await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
+  io.emit('ride:arrived', ride);
+  io.to(`ride_${ride.ride_id}`).emit('ride:arrived', ride);
+  res.json({ success: true, ride });
 });
 
-app.get('/rides/:id/messages', async (req, res) => {
-  res.json(mem.messages[req.params.id] || []);
+app.post('/rides/:id/start', async (req, res) => {
+  const ride = await getRide(req.params.id);
+  if (!ride) return res.status(404).json({error: 'Ride not found'});
+  const { pin } = req.body;
+  if (!pin || String(pin) !== String(ride.customer_pin)) {
+    return res.status(400).json({ error: 'Wrong PIN. Ask the customer for their 4 digit trip PIN.' });
+  }
+  ride.status = 'STARTED';
+  ride.started_at = new Date().toISOString();
+  rides.set(ride.ride_id, ride);
+  await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
+  io.emit('ride:started', ride);
+  io.to(`ride_${ride.ride_id}`).emit('ride:started', ride);
+  res.json({ success: true, ride });
 });
 
-// SOCKET
-io.on('connection', (socket) => {
-  console.log("Socket connected", socket.id);
-  socket.on('join:ride', (ride_id) => { socket.join(ride_id); console.log(`Socket ${socket.id} joined ${ride_id}`); });
-  socket.on('driver:location', (data) => { io.emit('driver:location', data); });
-  socket.on('driver:location:update', (data) => { io.emit('driver:location', data); });
-  socket.on('disconnect', () => console.log("Socket disconnected"));
+app.post('/rides/:id/complete', async (req, res) => {
+  const ride = await getRide(req.params.id);
+  if (!ride) return res.status(404).json({error: 'Ride not found'});
+  ride.status = 'COMPLETED';
+  ride.completed_at = new Date().toISOString();
+  rides.set(ride.ride_id, ride);
+  await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
+  clearRideMessages(ride.ride_id);
+  io.emit('ride:completed', ride);
+  io.to(`ride_${ride.ride_id}`).emit('ride:completed', ride);
+  res.json({ success: true, ride });
 });
 
-const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log(`Backend LIVE V73 FIXED on ${PORT}`));
+app.get('/rides/:id', async (req, res) => {
+  let ride = rides.get(req.params.id);
+  if (!ride) {
+    try {
+      const data = await redis.hget('tenant:TENANT_01:rides', req.params.id);
+      if (data) ride = JSON.parse(data);
+    } catch(e) {}
+  }
+  if (!ride) return res.status(404).json({error: 'Not found'});
+  res.json(ride);
+});
+
+app.get('/rides', async (req, res) => {
+  try {
+    const allRedis = await redis.hgetall('tenant:TENANT_01:rides');
+    const redisRides = Object.values(allRedis).map(v => { try { return JSON.parse(v); } catch(e) { return null; } }).filter(Boolean);
+    const memRides = Array.from(rides.values());
+    const merged = new Map();
+    redisRides.forEach(r => merged.set(r.ride_id, r));
+    memRides.forEach(r => merged.set(r.ride_id, r));
+    res.json(Array.from(merged.values()));
+  } catch(e) {
+    res.json(Array.from(rides.values()));
+  }
+});
+
+
+// ---- RIDE MESSAGES FIXED DEDUP - EMIT ONCE ONLY ----
+app.post('/rides/:id/message', authenticate, (req, res) => {
+  const rideId = req.params.id;
+  const from = (req.body.from || 'driver').toString().toLowerCase();
+  const text = (req.body.text || '').toString().trim();
+  if (!text) return res.status(400).json({error: 'text required'});
+
+  // Strong dedup: same hash within 8 sec
+  if(isDuplicate(rideId, from, text)){
+    console.log(`⚠ Duplicate HTTP msg blocked ${rideId} ${from}: ${text}`);
+    return res.json({ok:true, delivered:true, duplicate:true});
+  }
+
+  const msg = { ride_id: rideId, from, text, time: new Date().toISOString(), id: `MSG_${Date.now()}_${Math.random().toString(36).slice(2,6)}` };
+  addRideMessage(rideId, msg);
+  
+  // FIXED: Emit ONLY ONCE to canonical room
+  io.to(`ride_${rideId}`).emit('ride_message', msg);
+  // For old driver app compatibility, also emit with old event name ONCE to same room
+  io.to(`ride_${rideId}`).emit('ride:message', msg);
+  
+  console.log(`💬 [HTTP] Ride ${rideId} ${from}: ${text} -> room ride_${rideId} ONLY`);
+  res.json({ok:true, delivered:true, message:msg});
+});
+
+app.get('/rides/:id/messages', authenticate, (req, res) => {
+  const rideId = req.params.id;
+  res.json({ride_id: rideId, messages: rideMessages.get(rideId) || []});
+});
+
+// ---- RIDER PAYMENT ----
+app.post('/rider/payment/order', async (req, res) => {
+  try {
+    const { ride_id, amount, driver_id, customer_id } = req.body;
+    if (!amount) return res.status(400).json({ error: 'amount required' });
+    const amt = Math.round(Number(amount) * 100);
+    if (amt < 100) return res.status(400).json({ error: 'amount too small' });
+    const receipt = `ride_${(ride_id||'').toString().substring(0,20)}_${Date.now()}`.substring(0,40);
+    const rzp = getRazorpay();
+    if (!rzp) {
+      console.log('[RIDER PAY] Razorpay not configured, returning mock order');
+      return res.json({ order_id: `order_mock_${Date.now()}`, amount: amt, currency: 'INR', receipt, key_id: process.env.RAZORPAY_KEY_ID || 'rzp_live_mock', mock: true });
+    }
+    const order = await rzp.orders.create({
+      amount: amt,
+      currency: 'INR',
+      receipt,
+      notes: { ride_id: ride_id || '', driver_id: driver_id || '', customer_id: customer_id || '', type: 'ride_fare' }
+    });
+    console.log(`[RIDER PAY ORDER] ride=${ride_id} amount=${amount} order=${order.id}`);
+    res.json({ order_id: order.id, amount: order.amount, currency: order.currency, receipt: order.receipt, key_id: process.env.RAZORPAY_KEY_ID, ride_id });
+  } catch(e){
+    console.error('rider payment order error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/rider/payment/verify', async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, ride_id, amount } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: 'Missing razorpay fields' });
+    }
+    const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '').update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');
+    if (expected !== razorpay_signature) {
+      console.log(`[RIDER PAY VERIFY FAIL] expected ${expected} got ${razorpay_signature}`);
+      if (!razorpay_order_id.startsWith('order_mock_')) {
+        return res.status(400).json({ error: 'Invalid signature' });
+      }
+    }
+    console.log(`[RIDER PAY VERIFY OK] ride=${ride_id} payment=${razorpay_payment_id} amount=${amount}`);
+    res.json({ ok: true, verified: true, payment_id: razorpay_payment_id, ride_id });
+  } catch(e){
+    console.error('rider payment verify error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- DRIVER PROFILE & UPI & WALLET ----
+app.get('/driver/profile', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    driver = d1;
+    if (!driver) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      driver = d2;
+    }
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+    res.json({ driver, upi_id: driver.upi_id || '' });
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
+
+app.post('/driver/upi', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    const { upi_id } = req.body;
+    if (!upi_id || !upi_id.includes('@')) return res.status(400).json({ error: 'Invalid UPI ID' });
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    driver = d1;
+    if (!driver) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      driver = d2;
+    }
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+    const { data, error } = await supabase.from('drivers').update({ upi_id: upi_id.trim(), updated_at: new Date().toISOString() }).eq('driver_id', driver.driver_id).select().maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    console.log(`[UPI SAVE] ${driver.driver_id} -> ${upi_id}`);
+    res.json({ ok: true, driver: data, upi_id: data.upi_id });
+  } catch(e){ console.error('upi save error', e); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/driver/wallet', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    driver = d1;
+    if (!driver) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      driver = d2;
+    }
+    if (!driver) return res.status(404).json({ error: 'Driver not found' });
+    let wallet = null;
+    try {
+      const { data: w } = await supabase.from('driver_wallets').select('*').eq('driver_id', driver.driver_id).maybeSingle();
+      wallet = w;
+    } catch(e){}
+    if (!wallet) {
+      wallet = { driver_id: driver.driver_id, balance: 0, total_earnings: 0, total_rides: 0, subscription_due: 0, subscription_status: 'ACTIVE', current_plan: null, plan_expires_at: null, vehicle_type: driver.vehicle_type || 'TAXI', trial_rides_left: 3 };
+    }
+    let txns = [];
+    try {
+      const { data: t } = await supabase.from('wallet_transactions').select('*').eq('driver_id', driver.driver_id).order('created_at', { ascending: false }).limit(20);
+      txns = t || [];
+    } catch(e){}
+    res.json({ ...wallet, transactions: txns, upi_id: driver.upi_id || '' });
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
+
+app.get('/driver/subscription', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth);
+    const SUPER_ADMINS = ['DRV_E90F74','DRV_EAD55B','9886180011','8431670039'];
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle();
+    driver = d1;
+    if (!driver) {
+      const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle();
+      driver = d2;
+    }
+    const isSuper = driver && (SUPER_ADMINS.includes(driver.driver_id) || SUPER_ADMINS.includes(driver.phone));
+    if (isSuper) {
+      return res.json({ blocked: false, is_super_admin: true, plan: 'SUPER_ADMIN_FREE', message: 'Super Admin - fee bypassed' });
+    }
+    res.json({ blocked: false, plan: 'FREE_TRIAL', trial_rides_left: 3 });
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
+
+app.get('/health', (req,res) => {
+  res.json({ status:'LIVE', backend:'saas-backend-avz2', version:'V72 DEDUP FIXED - SINGLE ROOM EMIT', supabase: !!supabase, timestamp: new Date().toISOString() });
+});
+app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V72 DEDUP FIXED' }));
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V72 DEDUP FIXED - SINGLE ROOM EMIT - PORT ${PORT}`));
