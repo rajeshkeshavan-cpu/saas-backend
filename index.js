@@ -8,7 +8,6 @@ const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const jwt = require('jsonwebtoken');
 const Razorpay = require('razorpay');
-
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -19,7 +18,6 @@ redis.on('connect', () => console.log('✅ Redis connected'));
 redis.on('error', (err) => console.log('Redis error:', err.message));
 const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY, { auth: { persistSession: false } }) : null;
 global.supabase = supabase;
-if (!supabase) console.log('⚠️ Supabase not configured');
 const rides = new Map();
 global.onlineDrivers = {};
 const multer = require('multer');
@@ -53,7 +51,7 @@ function addRideMessage(rideId, msg){
   rideMessages.get(rideId).push(msg);
   if(rideMessages.get(rideId).length>50) rideMessages.set(rideId, rideMessages.get(rideId).slice(-50));
 }
-function clearRideMessages(rideId){ if(rideMessages.has(rideId)){ rideMessages.delete(rideId); recentMsgHashes.delete(rideId); console.log(`🧹 Cleared messages for ${rideId}`); } }
+function clearRideMessages(rideId){ if(rideMessages.has(rideId)){ rideMessages.delete(rideId); recentMsgHashes.delete(rideId); } }
 function getRazorpay() {
   if (razorpayInstance) return razorpayInstance;
   const key_id = process.env.RAZORPAY_KEY_ID; const key_secret = process.env.RAZORPAY_KEY_SECRET;
@@ -70,92 +68,117 @@ function getDriverIdFromToken(token) {
   return token;
 }
 
-// ========== ADMIN ROUTE V74 - FORCE NEW DASHBOARD - FIXES 404 ==========
+// ========== COMBINED ADMIN V75 - LIVE MAP + DOCS VERIFICATION ==========
 app.get('/admin', (req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  // Always serve fresh dashboard - ignore any old admin.html on disk
   res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>UrbanRide Admin V74 - Live Dashboard</title>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UrbanRide Admin V75 - Live + Docs</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:system-ui,-apple-system,sans-serif;background:#f5f5f5}
-.header{background:#1B5E20;color:#fff;padding:12px 20px;display:flex;justify-content:space-between;align-items:center}
-.header h1{font-size:18px}
-.header .stats{display:flex;gap:12px;font-size:11px;flex-wrap:wrap}
-.header .stat{background:rgba(255,255,255,0.15);padding:6px 12px;border-radius:20px}
-.container{display:flex;height:calc(100vh - 56px)}
-.sidebar{width:340px;background:#fff;border-right:1px solid #ddd;overflow-y:auto;padding:12px}
-.map-area{flex:1;position:relative}
-#map{height:100%;width:100%}
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#f5f5f5}
+.header{background:#1B5E20;color:#fff;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap}
+.header h1{font-size:16px}
+.tabs{display:flex;gap:8px;margin-left:20px}
+.tab{padding:6px 14px;border-radius:20px;cursor:pointer;font-size:12px;font-weight:bold;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.3);color:#fff}
+.tab.active{background:#fff;color:#1B5E20}
+.stats{display:flex;gap:8px;font-size:11px;flex-wrap:wrap}
+.stat{background:rgba(255,255,255,0.15);padding:5px 10px;border-radius:20px}
+.main{height:calc(100vh - 50px);display:flex}
+.sidebar{width:360px;background:#fff;border-right:1px solid #ddd;overflow-y:auto;padding:10px}
+.map-area{flex:1;position:relative}#map{height:100%;width:100%}
 .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:10px;margin-bottom:10px}
 .card h3{font-size:13px;margin-bottom:6px;color:#1B5E20}
 .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:bold;color:#fff}
-.badge-online{background:#2E7D32}.badge-offline{background:#999}.badge-REQUESTED{background:#1565C0}.badge-ACCEPTED{background:#EF6C00}.badge-ARRIVED{background:#F9A825}.badge-STARTED{background:#6A1B9A}.badge-COMPLETED{background:#2E7D32}.badge-CANCELLED{background:#C62828}
+.badge-online{background:#2E7D32}.badge-VERIFIED{background:#2E7D32}.badge-PENDING{background:#F9A825;color:#000}.badge-REJECTED{background:#C62828}
+.badge-REQUESTED{background:#1565C0}.badge-ACCEPTED{background:#EF6C00}.badge-ARRIVED{background:#F9A825}.badge-STARTED{background:#6A1B9A}.badge-COMPLETED{background:#2E7D32}.badge-CANCELLED{background:#C62828}
 .ride-item{border-left:3px solid #2E7D32;padding:8px;margin-bottom:8px;background:#fafafa;border-radius:6px;font-size:12px}
-.ride-item.cancelled{border-color:#C62828}
-.btn{padding:6px 12px;border:none;border-radius:6px;font-size:12px;cursor:pointer;font-weight:bold}
-.btn-green{background:#2E7D32;color:#fff}.btn-red{background:#C62828;color:#fff}.btn-blue{background:#1565C0;color:#fff}
-.version{position:absolute;bottom:10px;right:10px;background:#fff;padding:4px 8px;border-radius:6px;font-size:10px;z-index:999;border:1px solid #ddd}
+.btn{padding:6px 12px;border:none;border-radius:6px;font-size:11px;cursor:pointer;font-weight:bold}
+.btn-green{background:#2E7D32;color:#fff}.btn-red{background:#C62828;color:#fff}.btn-blue{background:#1565C0;color:#fff}.btn-orange{background:#EF6C00;color:#fff}
+.doc-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:6px}
+.doc{border:1px solid #ddd;padding:6px;border-radius:6px;font-size:11px;text-align:center}
+.doc.approved{border-color:#2E7D32;background:#E8F5E9}.doc.missing{border-color:#ccc;background:#fafafa;color:#999}
+.table-view{display:none;height:100%;overflow:auto;padding:12px;background:#f5f5f5}
+.table-view.active{display:block}
+table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden}
+th,td{padding:8px 10px;text-align:left;font-size:12px;border-bottom:1px solid #eee}
+th{background:#1B5E20;color:#fff;font-size:11px}
+tr:hover{background:#f9f9f9}
+.view{display:none}.view.active{display:flex}
 </style>
 </head>
 <body>
 <div class="header">
-  <h1>🚕 UrbanRide Admin V74 - LIVE</h1>
-  <div class="stats">
-    <div class="stat">🟢 Drivers: <span id="driverCount">0</span></div>
-    <div class="stat">🚕 Active: <span id="rideCount">0</span></div>
-    <div class="stat">💰 Today: ₹<span id="todayEarn">0</span></div>
-    <div class="stat" id="backendUrl">...</div>
+  <div style="display:flex;align-items:center"><h1>🚕 UrbanRide Admin V75</h1><div class="tabs"><div class="tab active" onclick="switchTab('live')">🗺️ Live Map</div><div class="tab" onclick="switchTab('drivers')">👥 Drivers DB</div><div class="tab" onclick="switchTab('docs')">📄 Docs</div></div></div>
+  <div class="stats"><div class="stat">🟢 Live: <span id="driverCount">0</span></div><div class="stat">🚕 Active: <span id="rideCount">0</span></div><div class="stat">💰 Today: ₹<span id="todayEarn">0</span></div></div>
+</div>
+
+<!-- LIVE MAP VIEW -->
+<div class="view active" id="view-live">
+  <div class="main">
+    <div class="sidebar">
+      <div class="card"><h3>🟢 Live Drivers (4s)</h3><div id="driversList">Loading...</div></div>
+      <div class="card"><h3>🚕 Recent Rides</h3><div id="ridesList">Loading...</div></div>
+    </div>
+    <div class="map-area"><div id="map"></div></div>
   </div>
 </div>
-<div class="container">
-  <div class="sidebar">
-    <div class="card"><h3>🟢 Live Drivers (4 sec update)</h3><div id="driversList">Loading...</div></div>
-    <div class="card"><h3>🚕 Recent Rides</h3><div style="margin-bottom:8px"><button class="btn btn-blue" onclick="loadRides()" style="font-size:11px">Refresh</button></div><div id="ridesList">Loading...</div></div>
-    <div class="card"><h3>🔧 Debug</h3><div style="font-size:11px"><button class="btn" onclick="localStorage.clear();location.reload()" style="font-size:10px">Clear Cache & Reload</button><div id="debug" style="margin-top:8px;color:#666"></div></div></div>
+
+<!-- DRIVERS DB VIEW -->
+<div class="view" id="view-drivers" style="flex-direction:column">
+  <div style="padding:12px;background:#fff;border-bottom:1px solid #ddd;display:flex;justify-content:space-between;align-items:center">
+    <h3>👥 All Drivers from Supabase</h3><button class="btn btn-blue" onclick="loadAllDrivers()">Refresh</button>
   </div>
-  <div class="map-area"><div id="map"></div><div class="version">V74 ADMIN + DEDUP • ${new Date().toISOString().slice(0,19)}</div></div>
+  <div class="table-view active" style="flex:1"><table id="driversTable"><thead><tr><th>Driver ID</th><th>Phone</th><th>Name</th><th>Vehicle</th><th>Number</th><th>Status</th><th>Police</th><th>UPI</th><th>Action</th></tr></thead><tbody id="driversTableBody"><tr><td colspan="9">Loading...</td></tr></tbody></table></div>
 </div>
+
+<!-- DOCS VIEW -->
+<div class="view" id="view-docs" style="flex-direction:column">
+  <div style="padding:12px;background:#fff;border-bottom:1px solid #ddd;display:flex;justify-content:space-between">
+    <h3>📄 Driver Documents</h3><button class="btn btn-blue" onclick="loadDocs()">Refresh</button>
+  </div>
+  <div class="table-view active" style="flex:1"><table><thead><tr><th>Driver</th><th>SELFIE</th><th>DL</th><th>RC</th><th>AADHAAR</th><th>POLICE</th><th>INSURANCE</th><th>PERMIT</th><th>FITNESS</th></tr></thead><tbody id="docsTableBody"><tr><td colspan="9">Loading...</td></tr></tbody></table></div>
+</div>
+
 <script>
 const BACKEND = window.location.origin;
-document.getElementById('backendUrl').textContent = BACKEND;
 let map = L.map('map').setView([12.9716, 77.5946], 12);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OSM' }).addTo(map);
 let driverMarkers = {};
+function switchTab(t){
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));
+  document.getElementById('view-'+t).classList.add('active');
+  document.querySelector('[onclick="switchTab(\\''+t+'\\')"]').classList.add('active');
+  if(t==='live') setTimeout(()=>map.invalidateSize(),100);
+  if(t==='drivers') loadAllDrivers();
+  if(t==='docs') loadDocs();
+}
 async function loadDrivers(){
   try{
     const res = await fetch(BACKEND+'/drivers', {cache:'no-store'});
     const drivers = await res.json();
     document.getElementById('driverCount').textContent = drivers.length;
     const list = document.getElementById('driversList');
-    if(drivers.length===0){ list.innerHTML='<div style="color:#999;font-size:12px">No drivers online - Go online from driver app</div>'; }
-    else {
-      list.innerHTML = drivers.map(d => \`
-        <div class="ride-item" style="border-color:#2E7D32">
-          <div style="display:flex;justify-content:space-between"><b>\${d.driver_id}</b><span class="badge badge-online">ONLINE</span></div>
-          <div style="font-size:11px;color:#666">\${parseFloat(d.lat).toFixed(5)}, \${parseFloat(d.lng).toFixed(5)}</div>
-          <button class="btn btn-blue" style="margin-top:4px;font-size:10px" onclick="focusDriver(\${d.lat},\${d.lng})">Focus</button>
-        </div>\`).join('');
-    }
+    if(drivers.length===0) list.innerHTML='<div style="color:#999;font-size:12px">No live drivers</div>';
+    else list.innerHTML = drivers.map(d => \`
+      <div class="ride-item"><div style="display:flex;justify-content:space-between"><b>\${d.driver_id}</b><span class="badge badge-online">ONLINE</span></div>
+      <div style="font-size:11px">\${parseFloat(d.lat).toFixed(5)}, \${parseFloat(d.lng).toFixed(5)}</div>
+      <button class="btn btn-blue" style="margin-top:4px;font-size:10px" onclick="focusDriver(\${d.lat},\${d.lng})">Focus</button></div>\`).join('');
     drivers.forEach(d=>{
       const lat=parseFloat(d.lat), lng=parseFloat(d.lng);
-      if(driverMarkers[d.driver_id]){ driverMarkers[d.driver_id].setLatLng([lat,lng]); }
+      if(driverMarkers[d.driver_id]) driverMarkers[d.driver_id].setLatLng([lat,lng]);
       else {
         const icon = L.divIcon({html:\`<div style="background:#2E7D32;color:#fff;padding:3px 8px;border-radius:12px;font-size:11px;font-weight:bold;border:2px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,0.4)">🚕 \${d.driver_id}</div>\`, className:''});
-        driverMarkers[d.driver_id] = L.marker([lat,lng], {icon}).addTo(map).bindPopup(\`Driver \${d.driver_id}<br>\${lat.toFixed(4)}, \${lng.toFixed(4)}\`);
+        driverMarkers[d.driver_id] = L.marker([lat,lng], {icon}).addTo(map).bindPopup(\`Driver \${d.driver_id}\`);
       }
     });
-    document.getElementById('debug').textContent = 'Last drivers fetch: ' + new Date().toLocaleTimeString() + ' - ' + drivers.length + ' online';
-  }catch(e){ console.log('drivers err', e); document.getElementById('debug').textContent = 'Drivers error: '+e.message; }
+  }catch(e){ console.log(e); }
 }
 async function loadRides(){
   try{
@@ -163,26 +186,97 @@ async function loadRides(){
     const rides = await res.json();
     const active = rides.filter(r=>['REQUESTED','ACCEPTED','ARRIVED','STARTED'].includes((r.status||'').toUpperCase()));
     document.getElementById('rideCount').textContent = active.length;
-    let todayEarn = 0; const today = new Date().toDateString();
-    rides.forEach(r=>{ if(r.status==='COMPLETED'){ try{ if(new Date(r.completed_at || r.created_at).toDateString()===today) todayEarn+= parseFloat(r.fare||0); }catch(e){} } });
-    document.getElementById('todayEarn').textContent = todayEarn;
-    const list = document.getElementById('ridesList');
-    if(rides.length===0){ list.innerHTML='<div style="color:#999">No rides</div>'; return; }
-    list.innerHTML = rides.slice(0,15).map(r=>{
-      const st = (r.status||'UNKNOWN').toUpperCase();
-      const cls = st==='CANCELLED' ? 'cancelled' : '';
-      return \`<div class="ride-item \${cls}"><div style="display:flex;justify-content:space-between"><b>\${r.ride_id}</b><span class="badge badge-\${st}">\${st}</span></div><div>₹\${r.fare||0} • \${r.driver_id||'No driver'}</div><div style="font-size:10px;color:#666">\${r.from?.name||'Pickup'} → \${r.to?.name||'Drop'}</div><div style="font-size:10px;color:#999">\${new Date(r.created_at).toLocaleString()}</div></div>\`;
-    }).join('');
-  }catch(e){ console.log('rides err', e); }
+    let todayEarn=0; const today=new Date().toDateString();
+    rides.forEach(r=>{ if(r.status==='COMPLETED'){ try{ if(new Date(r.completed_at||r.created_at).toDateString()===today) todayEarn+=parseFloat(r.fare||0);}catch(e){} }});
+    document.getElementById('todayEarn').textContent=todayEarn;
+    const list=document.getElementById('ridesList');
+    if(rides.length===0){list.innerHTML='<div style="color:#999">No rides</div>';return;}
+    list.innerHTML=rides.slice(0,15).map(r=>{const st=(r.status||'UNKNOWN').toUpperCase();return \`<div class="ride-item"><div style="display:flex;justify-content:space-between"><b>\${r.ride_id}</b><span class="badge badge-\${st}">\${st}</span></div><div>₹\${r.fare||0} • \${r.driver_id||'No driver'}</div><div style="font-size:10px;color:#666">\${r.from?.name||'Pickup'} → \${r.to?.name||'Drop'}</div></div>\`;}).join('');
+  }catch(e){}
 }
 function focusDriver(lat,lng){ map.setView([lat,lng], 16); }
-loadDrivers(); loadRides();
-setInterval(loadDrivers, 4000);
-setInterval(loadRides, 5000);
+async function loadAllDrivers(){
+  try{
+    const res = await fetch(BACKEND+'/admin/api/drivers', {cache:'no-store'});
+    const data = await res.json();
+    const tbody=document.getElementById('driversTableBody');
+    if(!data.drivers || data.drivers.length===0){tbody.innerHTML='<tr><td colspan=9>No drivers found</td></tr>';return;}
+    tbody.innerHTML=data.drivers.map(d=>\`
+      <tr><td><b>\${d.driver_id}</b></td><td>\${d.phone}</td><td>\${d.name}</td><td>\${d.vehicle_type}</td><td>\${d.vehicle_number}</td>
+      <td><span class="badge badge-\${d.status}">\${d.status}</span></td><td>\${d.police_verified?'✅':''} \${d.police_verified}</td>
+      <td style="font-size:10px">\${d.upi_id||''}</td>
+      <td><button class="btn btn-green" style="font-size:10px" onclick="verifyDriver('\${d.driver_id}')">Verify</button>
+      <button class="btn btn-red" style="font-size:10px" onclick="rejectDriver('\${d.driver_id}')">Reject</button></td></tr>\`).join('');
+  }catch(e){ document.getElementById('driversTableBody').innerHTML='<tr><td colspan=9>Error: '+e.message+'</td></tr>'; }
+}
+async function loadDocs(){
+  try{
+    const res = await fetch(BACKEND+'/admin/api/docs', {cache:'no-store'});
+    const data = await res.json();
+    const tbody=document.getElementById('docsTableBody');
+    if(!data.docs || data.docs.length===0){tbody.innerHTML='<tr><td colspan=9>No docs - drivers need to upload from app</td></tr>';return;}
+    // Group by driver
+    const byDriver={};
+    data.docs.forEach(doc=>{
+      if(!byDriver[doc.driver_id]) byDriver[doc.driver_id]={};
+      byDriver[doc.driver_id][doc.doc_type]=doc;
+    });
+    tbody.innerHTML=Object.keys(byDriver).map(driverId=>{
+      const docs=byDriver[driverId];
+      const check = (type)=>{ const d=docs[type]; if(!d) return '<span style="color:#999">❌ Missing</span>'; const status=d.status; if(status==='APPROVED') return \`<span style="color:green">✅ \${status}</span><br><a href="\${d.url}" target="_blank" style="font-size:10px">View</a>\`; return \`<span style="color:orange">\${status}</span><br><a href="\${d.url}" target="_blank" style="font-size:10px">View</a>\`; };
+      return \`<tr><td><b>\${driverId}</b></td><td>\${check('SELFIE')}</td><td>\${check('DL')}</td><td>\${check('RC')}</td><td>\${check('AADHAAR')}</td><td>\${check('POLICE')}</td><td>\${check('INSURANCE')}</td><td>\${check('PERMIT')}</td><td>\${check('FITNESS')}</td></tr>\`;
+    }).join('');
+  }catch(e){ document.getElementById('docsTableBody').innerHTML='<tr><td colspan=9>Error: '+e.message+'</td></tr>'; }
+}
+async function verifyDriver(id){ if(!confirm('Verify '+id+'?')) return; await fetch(BACKEND+'/admin/api/drivers/'+id+'/verify',{method:'POST'}); loadAllDrivers(); }
+async function rejectDriver(id){ const reason=prompt('Reject reason for '+id); if(!reason) return; await fetch(BACKEND+'/admin/api/drivers/'+id+'/reject',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason})}); loadAllDrivers(); }
+loadDrivers(); loadRides(); setInterval(loadDrivers,4000); setInterval(loadRides,5000);
 </script>
 </body>
 </html>
   `);
+});
+
+// Admin API - get all drivers from Supabase
+app.get('/admin/api/drivers', async (req,res)=>{
+  try{
+    if(!supabase) return res.json({error:'No supabase', drivers:[]});
+    const { data, error } = await supabase.from('drivers').select('driver_id,phone,name,vehicle_type,vehicle_number,status,police_verified,verified_at,created_at,updated_at,upi_id').order('created_at', {ascending:false});
+    if(error) return res.status(500).json({error:error.message});
+    res.json({drivers:data});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.get('/admin/api/docs', async (req,res)=>{
+  try{
+    if(!supabase) return res.json({docs:[]});
+    const { data, error } = await supabase.from('driver_documents').select('*').order('uploaded_at', {ascending:false}).limit(100);
+    if(error) return res.status(500).json({error:error.message});
+    // Generate public URLs
+    const docs = await Promise.all((data||[]).map(async d=>{
+      try{
+        const { data: urlData } = supabase.storage.from(process.env.DRIVER_DOCS_BUCKET || 'driver-docs').getPublicUrl(d.storage_path);
+        return {...d, url: urlData.publicUrl};
+      }catch(e){ return {...d, url:''}; }
+    }));
+    res.json({docs});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/admin/api/drivers/:id/verify', async (req,res)=>{
+  try{
+    if(!supabase) return res.status(500).json({error:'No supabase'});
+    const { error } = await supabase.from('drivers').update({status:'VERIFIED', police_verified:true, verified_at:new Date().toISOString(), updated_at:new Date().toISOString()}).eq('driver_id', req.params.id);
+    if(error) return res.status(500).json({error:error.message});
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+app.post('/admin/api/drivers/:id/reject', async (req,res)=>{
+  try{
+    if(!supabase) return res.status(500).json({error:'No supabase'});
+    const { reason } = req.body;
+    const { error } = await supabase.from('drivers').update({status:'REJECTED', rejection_reason:reason, updated_at:new Date().toISOString()}).eq('driver_id', req.params.id);
+    if(error) return res.status(500).json({error:error.message});
+    res.json({ok:true});
+  }catch(e){ res.status(500).json({error:e.message}); }
 });
 
 app.post('/driver/docs/upload', (req, res) => {
@@ -378,10 +472,9 @@ app.get('/rides', async (req, res) => {
 app.post('/rides/:id/message', authenticate, (req, res) => {
   const rideId = req.params.id; const from = (req.body.from || 'driver').toString().toLowerCase(); const text = (req.body.text || '').toString().trim();
   if (!text) return res.status(400).json({error: 'text required'});
-  if(isDuplicate(rideId, from, text)){ console.log(`⚠ Duplicate HTTP msg blocked ${rideId} ${from}: ${text}`); return res.json({ok:true, delivered:true, duplicate:true}); }
+  if(isDuplicate(rideId, from, text)){ return res.json({ok:true, delivered:true, duplicate:true}); }
   const msg = { ride_id: rideId, from, text, time: new Date().toISOString(), id: `MSG_${Date.now()}_${Math.random().toString(36).slice(2,6)}` };
   addRideMessage(rideId, msg); io.to(`ride_${rideId}`).emit('ride_message', msg); io.to(`ride_${rideId}`).emit('ride:message', msg);
-  console.log(`💬 [HTTP] Ride ${rideId} ${from}: ${text} -> room ride_${rideId} ONLY`);
   res.json({ok:true, delivered:true, message:msg});
 });
 app.get('/rides/:id/messages', authenticate, (req, res) => { const rideId = req.params.id; res.json({ride_id: rideId, messages: rideMessages.get(rideId) || []}); });
@@ -438,7 +531,7 @@ app.get('/driver/subscription', async (req, res) => {
     res.json({ blocked: false, plan: 'FREE_TRIAL', trial_rides_left: 3 });
   } catch(e){ res.status(500).json({ error: e.message }); }
 });
-app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V74 ADMIN + DEDUP FIXED - FORCE NO CACHE', supabase: !!supabase, timestamp: new Date().toISOString() }); });
-app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V74 ADMIN + DEDUP FIXED', admin:'/admin' }));
+app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V75 COMBINED ADMIN LIVE+DOCS + DEDUP', supabase: !!supabase, timestamp: new Date().toISOString() }); });
+app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V75 COMBINED ADMIN', admin:'/admin' }));
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V74 ADMIN + DEDUP FIXED - PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V75 COMBINED ADMIN - PORT ${PORT}`));
