@@ -625,3 +625,5 @@ app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V80 DOCS FI
 app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V80 DOCS FIX', admin:'/admin', login:'/driver/login' }));
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V80 DOCS FIX - PORT ${PORT}`));
+
+// V80 deploy 11/25/2026 15:58:23 - driver/me fix
