@@ -710,5 +710,72 @@ app.get('/health', (req,res) => {
 });
 app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V55' }));
 
+const rideMessages = new Map(); // in-memory, auto-clears after COMPLETE/CANCEL
+
+function addRideMessage(rideId, msg) {
+  if (!rideMessages.has(rideId)) rideMessages.set(rideId, []);
+  rideMessages.get(rideId).push(msg);
+  // Keep only last 50 per ride
+  if (rideMessages.get(rideId).length > 50) rideMessages.set(rideId, rideMessages.get(rideId).slice(-50));
+}
+
+function clearRideMessages(rideId) {
+  rideMessages.delete(rideId);
+  console.log(`Cleared messages for ${rideId}`);
+}
+
+// Socket: join ride room
+// In your io.on('connection') add:
+io.on('connection', (socket) => {
+  console.log('Socket connected', socket.id);
+  socket.on('join:ride', (rideId) => {
+    const room = typeof rideId === 'string' ? rideId : rideId?.ride_id;
+    if (room) {
+      socket.join(`ride_${room}`);
+      socket.join(room);
+      console.log(`Socket ${socket.id} joined ride_${room}`);
+    }
+  });
+});
+
+// POST /rides/:id/message - driver<->customer in-app chat
+app.post('/rides/:id/message', authenticate, (req, res) => {
+  const rideId = req.params.id;
+  const from = (req.body.from || 'driver').toString().toLowerCase(); // 'driver' or 'customer'
+  const text = (req.body.text || '').toString().trim();
+  if (!text) return res.status(400).json({error: 'text required'});
+  
+  const msg = {
+    ride_id: rideId,
+    from,
+    text,
+    time: new Date().toISOString(),
+  };
+  addRideMessage(rideId, msg);
+  
+  // Emit to both driver and customer in ride room
+  io.to(`ride_${rideId}`).emit('ride_message', msg);
+  io.to(rideId).emit('ride_message', msg);
+  io.to(`ride_${rideId}`).emit('new_message', msg);
+  io.to(rideId).emit('new_message', msg);
+  
+  console.log(`Ride message ${rideId} ${from}: ${text}`);
+  res.json({ok: true, delivered: true, message: msg});
+});
+
+app.get('/rides/:id/messages', authenticate, (req, res) => {
+  const rideId = req.params.id;
+  const msgs = rideMessages.get(rideId) || [];
+  res.json({ride_id: rideId, messages: msgs});
+});
+
+// In your COMPLETE / CANCEL handlers, add clear:
+// After ride status becomes COMPLETED or CANCELLED:
+// clearRideMessages(rideId);
+
+// Example in ride complete endpoint:
+// app.post('/rides/:id/complete', ... ) { ... clearRideMessages(req.params.id); ... }
+// app.post('/rides/:id/cancel', ... ) { ... clearRideMessages(req.params.id); ... }
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V54 JWT+URL+PORT FIX - PORT ${PORT}`));
