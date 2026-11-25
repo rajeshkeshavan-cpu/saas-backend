@@ -163,7 +163,7 @@ th{background:#1B5E20;color:#fff;font-size:11px}
 <body>
 <div class="header">
   <div style="display:flex;align-items:center"><h1>🚕 Admin V77 - Call Rider Fix + Login</h1><div class="tabs"><div class="tab active" onclick="switchTab('live')">🗺️ Live Map</div><div class="tab" onclick="switchTab('drivers')">👥 Drivers DB</div><div class="tab" onclick="switchTab('docs')">📄 Docs</div></div></div>
-  <div class="stats"><div class="stat">🟢 Live: <span id="driverCount">0</span></div><div class="stat">🚕 Active: <span id="rideCount">0</span></div><div class="stat">💰 Today: ₹<span id="todayEarn">0</span></div><div class="stat">V80 DOCS FIX</div></div>
+  <div class="stats"><div class="stat">🟢 Live: <span id="driverCount">0</span></div><div class="stat">🚕 Active: <span id="rideCount">0</span></div><div class="stat">💰 Today: ₹<span id="todayEarn">0</span></div><div class="stat">V81 CLEANUP DRIVERS</div></div>
 </div>
 <div class="view active" id="view-live" style="flex-direction:row;height:calc(100vh - 50px)">
   <div class="sidebar">
@@ -376,7 +376,73 @@ app.get('/drivers', async (req, res) => {
   try {
     const driverKeys = await redis.keys('driver:*:location');
     let drivers = [];
-    for (let key of driverKeys) { const data = await redis.hgetall(key); if (data && data.lat) { let driverId = key.split(':')[1]; drivers.push({ driver_id: driverId, lat: parseFloat(data.lat), lng: parseFloat(data.lng), last_seen: data.updated_at, online: true }); } }
+    for (let key of driverKeys) { const data = await redis.hgetall(key); if (data && data.lat) { let driverId = key.split(':')[1]; drivers.push({ driver_id: driverId, lat: parseFloat(data.lat), lng: parseFloat(data.lng), last_seen: data.updated_at, online: true });
+
+, async (req, res) => {
+  try {
+    const keys = await redis.keys('driver:*');
+    const drivers = [];
+    for(const k of keys){
+      const d = await redis.hgetall(k);
+      if(d && d.lat) {
+        // Check if driver still fresh (< 5 min)
+        const lastSeen = parseInt(d.lastSeen || d.updatedAt || '0');
+        const now = Date.now();
+        if(lastSeen && now - lastSeen > 300000) {
+          // Skip stale >5min unless it's real drivers
+          if(!['DRV_E90F74','DRV_EAD55B'].includes(k.replace('driver:',''))) continue;
+        }
+        drivers.push({ driver_id: k.replace('driver:',''), lat: d.lat, lng: d.lng, online: d.online==='1', lastSeen });
+      }
+    }
+    Object.keys(global.onlineDrivers).forEach(id=>{
+      if(!drivers.find(x=>x.driver_id===id)){
+        const g = global.onlineDrivers[id];
+        drivers.push({ driver_id: id, lat: g.lat, lng: g.lng, online: true });
+      }
+    });
+    res.json(drivers);
+  } catch(e){ res.json([]); }
+});
+
+app.get('/admin/clear-redis-drivers', async (req,res)=>{
+  try{
+    const keys = await redis.keys('driver:*');
+    let deleted = [];
+    for(const k of keys){
+      const id = k.replace('driver:','');
+      if(!['DRV_E90F74','DRV_EAD55B'].includes(id)){
+        await redis.del(k);
+        deleted.push(id);
+      }
+    }
+    // Clear global.onlineDrivers except real
+    Object.keys(global.onlineDrivers).forEach(id=>{
+      if(!['DRV_E90F74','DRV_EAD55B'].includes(id)){
+        delete global.onlineDrivers[id];
+        deleted.push(id+'(mem)');
+      }
+    });
+    // Also clear driver location keys
+    const locKeys = await redis.keys('driver_location:*');
+    for(const k of locKeys){ const id=k.split(':')[1]; if(!['DRV_E90F74','DRV_EAD55B'].includes(id)) await redis.del(k); }
+    
+    console.log('🧹 Cleared old drivers', deleted);
+    res.json({cleared: deleted, remaining: ['DRV_E90F74','DRV_EAD55B'], message: 'Cleared '+deleted.length+' old test drivers'});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.get('/admin/force-clear-all-drivers', async (req,res)=>{
+  try{
+    const keys = await redis.keys('driver:*');
+    for(const k of keys) await redis.del(k);
+    const locKeys = await redis.keys('driver_location:*');
+    for(const k of locKeys) await redis.del(k);
+    global.onlineDrivers = {};
+    res.json({message: 'All drivers cleared from Redis. Real drivers will re-appear when they go online again.'});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+ } }
     for (let id in global.onlineDrivers) { if (!drivers.find(d => d.driver_id === id)) drivers.push(global.onlineDrivers[id]); }
     res.json(drivers);
   } catch (e) { res.json([]); }
@@ -621,7 +687,7 @@ app.get('/driver/subscription', async (req, res) => {
     res.json({ blocked: false, plan: 'FREE_TRIAL', trial_rides_left: 3 });
   } catch(e){ res.status(500).json({ error: e.message }); }
 });
-app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V80 DOCS FIX + DRIVER/ME + PUBLIC BUCKET', supabase: !!supabase, timestamp: new Date().toISOString() }); });
-app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V80 DOCS FIX', admin:'/admin', login:'/driver/login' }));
+app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V81 CLEANUP DRIVERS + DRIVER/ME + PUBLIC BUCKET', supabase: !!supabase, timestamp: new Date().toISOString() }); });
+app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V81 CLEANUP DRIVERS', admin:'/admin', login:'/driver/login' }));
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V80 DOCS FIX - PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V81 CLEANUP DRIVERS - PORT ${PORT}`));
