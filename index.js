@@ -545,6 +545,8 @@ app.post('/driver/location', async (req, res) => {
   global.onlineDrivers[driver_id] = { driver_id, lat, lng, last_seen: Date.now(), online: true };
   res.json({ success: true });
 });
+function checkAndSetDedup(rideId, from, text){ const hash = `${rideId}::${from}::${text.toLowerCase().trim()}`; if(!global._lastMsgMap) global._lastMsgMap = new Map(); const now = Date.now(); const last = global._lastMsgMap.get(hash); if(last && now - last < 3000) return false; global._lastMsgMap.set(hash, now); for(const [k,v] of global._lastMsgMap.entries()){ if(now - v > 10000) global._lastMsgMap.delete(k); } return true; }
+
 io.on('connection', (socket) => {
   console.log(`✅ Connected: ${socket.id}`);
   socket.on('driver:location:update', async (data) => {
@@ -561,12 +563,30 @@ io.on('connection', (socket) => {
   socket.on('join:ride', (rideId) => {
     try{ const r = typeof rideId === 'string' ? rideId : (rideId?.ride_id || rideId?.rideId || rideId); if(r){ const room = `ride_${r}`; socket.join(room); console.log(`Socket ${socket.id} joined ${room}`); } }catch(e){}
   });
+  function checkAndSetDedup(rideId, from, text){
+    const hash = `${rideId}::${from}::${text.toLowerCase().trim()}`;
+    if(!global._lastMsgMap) global._lastMsgMap = new Map();
+    const now = Date.now();
+    const last = global._lastMsgMap.get(hash);
+    if(last && now - last < 3000){
+      return false; // duplicate within 3 sec
+    }
+    global._lastMsgMap.set(hash, now);
+    // cleanup old
+    for(const [k,v] of global._lastMsgMap.entries()){ if(now - v > 10000) global._lastMsgMap.delete(k); }
+    return true;
+  }
+
   socket.on('ride_message', (data) => {
     try{
       const rideId = data?.ride_id || data?.rideId;
       if(rideId){ 
         const msg = { ride_id: rideId, from: (data.from||'driver').toString().toLowerCase(), text: (data.text||'').toString().trim(), time: data.time || new Date().toISOString(), id: data.id || `MSG_${Date.now()}_${Math.random().toString(36).slice(2,6)}` }; 
         if(!msg.text) return;
+        if(!checkAndSetDedup(rideId, msg.from, msg.text)){
+          console.log(`⚠️ Socket duplicate ignored ${rideId} ${msg.from}: ${msg.text}`);
+          return;
+        }
         addRideMessage(rideId, msg); 
         io.to(`ride_${rideId}`).emit('ride_message', msg);
         console.log(`💬 Socket message ${rideId} ${msg.from}: ${msg.text}`);
@@ -579,6 +599,7 @@ io.on('connection', (socket) => {
       if(rideId){ 
         const msg = { ride_id: rideId, from: (data.from||'driver').toString().toLowerCase(), text: (data.text||'').toString().trim(), time: data.time || new Date().toISOString(), id: data.id || `MSG_${Date.now()}` }; 
         if(!msg.text) return;
+        if(!checkAndSetDedup(rideId, msg.from, msg.text)) return;
         addRideMessage(rideId, msg); 
         io.to(`ride_${rideId}`).emit('ride_message', msg);
       }
@@ -689,16 +710,10 @@ app.post('/rides/:id/message', authenticate, (req, res) => {
   const text = (req.body.text || '').toString().trim();
   if (!text) return res.status(400).json({error: 'text required'});
   const msg = { ride_id: rideId, from, text, time: new Date().toISOString(), id: `MSG_${Date.now()}_${Math.random().toString(36).slice(2,6)}` };
-  // Dedup only if same from+text within 2 sec
-  const hash = `${rideId}::${from}::${text.toLowerCase()}`;
-  if(!global._lastMsgMap) global._lastMsgMap = new Map();
-  const now = Date.now();
-  const last = global._lastMsgMap.get(hash);
-  if(last && now - last < 2000){
-    console.log(`⚠️ Fast duplicate ignored ${rideId} ${from}: ${text}`);
+  if(!checkAndSetDedup(rideId, from, text)){
+    console.log(`⚠️ HTTP duplicate ignored ${rideId} ${from}: ${text}`);
     return res.json({ok:true, delivered:true, duplicate:true, message:msg});
   }
-  global._lastMsgMap.set(hash, now);
   addRideMessage(rideId, msg); 
   io.to(`ride_${rideId}`).emit('ride_message', msg); 
   console.log(`💬 HTTP message ${rideId} ${from}: ${text} -> room ride_${rideId}`);
