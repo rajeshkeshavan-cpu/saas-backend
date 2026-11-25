@@ -163,7 +163,7 @@ th{background:#1B5E20;color:#fff;font-size:11px}
 <body>
 <div class="header">
   <div style="display:flex;align-items:center"><h1>🚕 Admin V77 - Call Rider Fix + Login</h1><div class="tabs"><div class="tab active" onclick="switchTab('live')">🗺️ Live Map</div><div class="tab" onclick="switchTab('drivers')">👥 Drivers DB</div><div class="tab" onclick="switchTab('docs')">📄 Docs</div></div></div>
-  <div class="stats"><div class="stat">🟢 Live: <span id="driverCount">0</span></div><div class="stat">🚕 Active: <span id="rideCount">0</span></div><div class="stat">💰 Today: ₹<span id="todayEarn">0</span></div><div class="stat">V77 CALL FIX</div></div>
+  <div class="stats"><div class="stat">🟢 Live: <span id="driverCount">0</span></div><div class="stat">🚕 Active: <span id="rideCount">0</span></div><div class="stat">💰 Today: ₹<span id="todayEarn">0</span></div><div class="stat">V80 DOCS FIX</div></div>
 </div>
 <div class="view active" id="view-live" style="flex-direction:row;height:calc(100vh - 50px)">
   <div class="sidebar">
@@ -539,72 +539,52 @@ app.get('/driver/profile', async (req, res) => {
   } catch(e){ res.status(500).json({ error: e.message }); }
 });
 
-// NEW: /driver/me - Returns driver + documents with public URLs - Used by DocumentsPage
 app.get('/driver/me', async (req, res) => {
   try {
     const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim(); 
     if (!rawAuth) return res.status(401).json({ error: 'No token' });
-    const driverId = getDriverIdFromToken(rawAuth); 
+    let driverId = getDriverIdFromToken(rawAuth);
     let driver = null;
-    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle(); driver = d1;
-    if (!driver) { const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle(); driver = d2; }
-    if (!driver) { 
-      try { const decoded = jwt.verify(rawAuth, JWT_SECRET); if(decoded && decoded.driver_id){ const { data: d3 } = await supabase.from('drivers').select('*').eq('driver_id', decoded.driver_id).maybeSingle(); driver = d3; } }catch(e){}
+    if (driverId) {
+      const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle(); driver = d1;
+      if (!driver) { const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle(); driver = d2; }
+    }
+    if (!driver) {
+      try { const decoded = jwt.verify(rawAuth, JWT_SECRET); if(decoded && decoded.driver_id){ const { data: d3 } = await supabase.from('drivers').select('*').eq('driver_id', decoded.driver_id).maybeSingle(); driver = d3; driverId = decoded.driver_id; } }catch(e){}
     }
     if (!driver) return res.status(404).json({ error: 'Driver not found for '+driverId });
-
-    // Fetch all documents for this driver
-    const { data: docsRaw, error: docsErr } = await supabase.from('driver_documents').select('*').eq('driver_id', driver.driver_id).order('uploaded_at', {ascending:false});
-    if(docsErr) console.log('docs fetch error', docsErr.message);
-    
+    const { data: docsRaw } = await supabase.from('driver_documents').select('*').eq('driver_id', driver.driver_id).order('uploaded_at', {ascending:false});
+    const bucket = process.env.DRIVER_DOCS_BUCKET || 'driver-docs';
     const documents = await Promise.all((docsRaw||[]).map(async d=>{
       try{
-        const bucket = process.env.DRIVER_DOCS_BUCKET || 'driver-docs';
         const { data: urlData } = supabase.storage.from(bucket).getPublicUrl(d.storage_path);
-        return {
-          doc_type: d.doc_type,
-          type: d.doc_type,
-          url: urlData.publicUrl,
-          storage_path: d.storage_path,
-          status: d.status || 'APPROVED',
-          uploaded_at: d.uploaded_at
-        };
-      }catch(e){ 
-        return {
-          doc_type: d.doc_type,
-          type: d.doc_type,
-          url: '',
-          storage_path: d.storage_path,
-          status: d.status,
-          uploaded_at: d.uploaded_at
-        };
-      }
+        return { doc_type: d.doc_type, type: d.doc_type, url: urlData.publicUrl, storage_path: d.storage_path, status: d.status || 'APPROVED', uploaded_at: d.uploaded_at };
+      }catch(e){ return { doc_type: d.doc_type, type: d.doc_type, url: '', storage_path: d.storage_path, status: d.status, uploaded_at: d.uploaded_at }; }
     }));
-
-    // Build driver with doc urls for legacy fallback
     const driverWithUrls = {...driver};
-    documents.forEach(doc=>{
-      const type = (doc.doc_type||'').toUpperCase();
-      if(type==='SELFIE') driverWithUrls.selfie_url = doc.url;
-      if(type==='DL') driverWithUrls.dl_url = doc.url;
-      if(type==='AADHAAR') driverWithUrls.aadhaar_url = doc.url;
-      if(type==='RC') driverWithUrls.rc_url = doc.url;
-      if(type==='PERMIT') driverWithUrls.permit_url = doc.url;
-      if(type==='INSURANCE') driverWithUrls.insurance_url = doc.url;
-      if(type==='POLICE') driverWithUrls.police_url = doc.url;
-    });
-
+    documents.forEach(doc=>{ const type=(doc.doc_type||'').toUpperCase(); if(type==='SELFIE') driverWithUrls.selfie_url=doc.url; if(type==='DL') driverWithUrls.dl_url=doc.url; if(type==='AADHAAR') driverWithUrls.aadhaar_url=doc.url; if(type==='RC') driverWithUrls.rc_url=doc.url; if(type==='PERMIT') driverWithUrls.permit_url=doc.url; if(type==='INSURANCE') driverWithUrls.insurance_url=doc.url; if(type==='POLICE') driverWithUrls.police_url=doc.url; });
     console.log(`📄 /driver/me ${driver.driver_id} docs=${documents.length}`);
-    res.json({ 
-      driver: driverWithUrls, 
-      documents: documents,
-      docs: documents,
-      upi_id: driver.upi_id || ''
-    });
-  } catch(e){ 
-    console.error('/driver/me error', e);
-    res.status(500).json({ error: e.message }); 
-  }
+    res.json({ driver: driverWithUrls, documents, docs: documents, upi_id: driver.upi_id || '' });
+  } catch(e){ console.error('/driver/me error', e); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/driver/docs/:type/url', async (req,res)=>{
+  try{
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim();
+    if (!rawAuth) return res.status(401).json({error:'No token'});
+    const driverId = getDriverIdFromToken(rawAuth);
+    const docType = (req.params.type||'').toUpperCase();
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('driver_id').eq('driver_id', driverId).maybeSingle(); driver=d1;
+    if(!driver){ const { data: d2 } = await supabase.from('drivers').select('driver_id').eq('phone', driverId).maybeSingle(); driver=d2; }
+    if(!driver){ try{ const dec=jwt.verify(rawAuth, JWT_SECRET); if(dec && dec.driver_id){ const { data: d3 } = await supabase.from('drivers').select('driver_id').eq('driver_id', dec.driver_id).maybeSingle(); driver=d3; } }catch(e){} }
+    if(!driver) return res.status(404).json({error:'Driver not found'});
+    const { data: doc } = await supabase.from('driver_documents').select('*').eq('driver_id', driver.driver_id).eq('doc_type', docType).order('uploaded_at',{ascending:false}).limit(1).maybeSingle();
+    if(!doc) return res.status(404).json({error:'Doc not found'});
+    const bucket = process.env.DRIVER_DOCS_BUCKET || 'driver-docs';
+    const { data: urlData } = supabase.storage.from(bucket).getPublicUrl(doc.storage_path);
+    res.json({url: urlData.publicUrl, status: doc.status, storage_path: doc.storage_path, doc_type: doc.doc_type});
+  }catch(e){ res.status(500).json({error:e.message}); }
 });
 
 app.post('/driver/upi', async (req, res) => {
@@ -641,7 +621,7 @@ app.get('/driver/subscription', async (req, res) => {
     res.json({ blocked: false, plan: 'FREE_TRIAL', trial_rides_left: 3 });
   } catch(e){ res.status(500).json({ error: e.message }); }
 });
-app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V78 DOCS FIX + ME ENDPOINT + LOGIN + CALL RIDER', supabase: !!supabase, timestamp: new Date().toISOString() }); });
-app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V78 DOCS FIX', admin:'/admin', login:'/driver/login' }));
+app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V80 DOCS FIX + DRIVER/ME + PUBLIC BUCKET', supabase: !!supabase, timestamp: new Date().toISOString() }); });
+app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V80 DOCS FIX', admin:'/admin', login:'/driver/login' }));
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V78 DOCS FIX - PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V80 DOCS FIX - PORT ${PORT}`));
