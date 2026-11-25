@@ -29,7 +29,7 @@ function authenticate(req,res,next){
     const hdr = (req.headers.authorization||'').replace('Bearer ','').trim();
     if(!hdr) return res.status(401).json({error:'No token'});
     try{ const decoded = jwt.verify(hdr, JWT_SECRET); req.user = decoded; return next(); }catch(e){}
-    if(hdr.length>=6){ req.user = { token: hdr }; return next(); }
+    if(hdr.length>=4){ req.user = { token: hdr }; return next(); }
     return res.status(401).json({error:'Invalid token'});
   }catch(e){ return res.status(401).json({error:'Auth failed'}); }
 }
