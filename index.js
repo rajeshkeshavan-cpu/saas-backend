@@ -538,6 +538,75 @@ app.get('/driver/profile', async (req, res) => {
     if (!driver) return res.status(404).json({ error: 'Driver not found' }); res.json({ driver, upi_id: driver.upi_id || '' });
   } catch(e){ res.status(500).json({ error: e.message }); }
 });
+
+// NEW: /driver/me - Returns driver + documents with public URLs - Used by DocumentsPage
+app.get('/driver/me', async (req, res) => {
+  try {
+    const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim(); 
+    if (!rawAuth) return res.status(401).json({ error: 'No token' });
+    const driverId = getDriverIdFromToken(rawAuth); 
+    let driver = null;
+    const { data: d1 } = await supabase.from('drivers').select('*').eq('driver_id', driverId).maybeSingle(); driver = d1;
+    if (!driver) { const { data: d2 } = await supabase.from('drivers').select('*').eq('phone', driverId).maybeSingle(); driver = d2; }
+    if (!driver) { 
+      try { const decoded = jwt.verify(rawAuth, JWT_SECRET); if(decoded && decoded.driver_id){ const { data: d3 } = await supabase.from('drivers').select('*').eq('driver_id', decoded.driver_id).maybeSingle(); driver = d3; } }catch(e){}
+    }
+    if (!driver) return res.status(404).json({ error: 'Driver not found for '+driverId });
+
+    // Fetch all documents for this driver
+    const { data: docsRaw, error: docsErr } = await supabase.from('driver_documents').select('*').eq('driver_id', driver.driver_id).order('uploaded_at', {ascending:false});
+    if(docsErr) console.log('docs fetch error', docsErr.message);
+    
+    const documents = await Promise.all((docsRaw||[]).map(async d=>{
+      try{
+        const bucket = process.env.DRIVER_DOCS_BUCKET || 'driver-docs';
+        const { data: urlData } = supabase.storage.from(bucket).getPublicUrl(d.storage_path);
+        return {
+          doc_type: d.doc_type,
+          type: d.doc_type,
+          url: urlData.publicUrl,
+          storage_path: d.storage_path,
+          status: d.status || 'APPROVED',
+          uploaded_at: d.uploaded_at
+        };
+      }catch(e){ 
+        return {
+          doc_type: d.doc_type,
+          type: d.doc_type,
+          url: '',
+          storage_path: d.storage_path,
+          status: d.status,
+          uploaded_at: d.uploaded_at
+        };
+      }
+    }));
+
+    // Build driver with doc urls for legacy fallback
+    const driverWithUrls = {...driver};
+    documents.forEach(doc=>{
+      const type = (doc.doc_type||'').toUpperCase();
+      if(type==='SELFIE') driverWithUrls.selfie_url = doc.url;
+      if(type==='DL') driverWithUrls.dl_url = doc.url;
+      if(type==='AADHAAR') driverWithUrls.aadhaar_url = doc.url;
+      if(type==='RC') driverWithUrls.rc_url = doc.url;
+      if(type==='PERMIT') driverWithUrls.permit_url = doc.url;
+      if(type==='INSURANCE') driverWithUrls.insurance_url = doc.url;
+      if(type==='POLICE') driverWithUrls.police_url = doc.url;
+    });
+
+    console.log(`📄 /driver/me ${driver.driver_id} docs=${documents.length}`);
+    res.json({ 
+      driver: driverWithUrls, 
+      documents: documents,
+      docs: documents,
+      upi_id: driver.upi_id || ''
+    });
+  } catch(e){ 
+    console.error('/driver/me error', e);
+    res.status(500).json({ error: e.message }); 
+  }
+});
+
 app.post('/driver/upi', async (req, res) => {
   try {
     const rawAuth = (req.headers.authorization || '').replace('Bearer ', '').trim(); const driverId = getDriverIdFromToken(rawAuth); const { upi_id } = req.body;
@@ -572,7 +641,7 @@ app.get('/driver/subscription', async (req, res) => {
     res.json({ blocked: false, plan: 'FREE_TRIAL', trial_rides_left: 3 });
   } catch(e){ res.status(500).json({ error: e.message }); }
 });
-app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V77 CALL RIDER FIX + CUSTOMER PHONE + DEDUP + LOGIN', supabase: !!supabase, timestamp: new Date().toISOString() }); });
-app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V77 CALL RIDER FIX', admin:'/admin', login:'/driver/login' }));
+app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V78 DOCS FIX + ME ENDPOINT + LOGIN + CALL RIDER', supabase: !!supabase, timestamp: new Date().toISOString() }); });
+app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V78 DOCS FIX', admin:'/admin', login:'/driver/login' }));
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V77 CALL RIDER FIX - PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V78 DOCS FIX - PORT ${PORT}`));
