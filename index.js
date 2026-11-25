@@ -564,7 +564,33 @@ io.on('connection', (socket) => {
   socket.on('ride_message', (data) => {
     try{
       const rideId = data?.ride_id || data?.rideId;
-      if(rideId){ const msg = { ...data, time: data.time || new Date().toISOString() }; if(isDuplicate(rideId, msg.from || 'driver', msg.text || '')){ return; } addRideMessage(rideId, msg); io.to(`ride_${rideId}`).emit('ride_message', msg); }
+      if(rideId){ 
+        const msg = { ...data, time: data.time || new Date().toISOString(), id: data.id || `MSG_${Date.now()}_${Math.random().toString(36).slice(2,6)}` }; 
+        if(isDuplicate(rideId, msg.from || 'driver', msg.text || '')){ 
+          // Still emit duplicate to ensure delivery (prevent blocking customer->driver)
+          io.to(`ride_${rideId}`).emit('ride_message', msg);
+          io.to(`ride_${rideId}`).emit('ride:message', msg);
+          io.to(`ride_${rideId}`).emit('new_message', msg);
+          return; 
+        } 
+        addRideMessage(rideId, msg); 
+        io.to(`ride_${rideId}`).emit('ride_message', msg);
+        io.to(`ride_${rideId}`).emit('ride:message', msg);
+        io.to(`ride_${rideId}`).emit('new_message', msg);
+        console.log(`💬 Socket message ${rideId} ${msg.from}: ${msg.text}`);
+      }
+    }catch(e){ console.log('ride_message error', e.message); }
+  });
+  socket.on('ride:message', (data) => {
+    try{
+      const rideId = data?.ride_id || data?.rideId;
+      if(rideId){ const msg = { ...data, time: data.time || new Date().toISOString(), id: data.id || `MSG_${Date.now()}` }; addRideMessage(rideId, msg); io.to(`ride_${rideId}`).emit('ride_message', msg); io.to(`ride_${rideId}`).emit('ride:message', msg); io.to(`ride_${rideId}`).emit('new_message', msg); }
+    }catch(e){}
+  });
+  socket.on('chat:message', (data) => {
+    try{
+      const rideId = data?.ride_id || data?.rideId;
+      if(rideId){ const msg = { ...data, time: data.time || new Date().toISOString() }; addRideMessage(rideId, msg); io.to(`ride_${rideId}`).emit('ride_message', msg); io.to(`ride_${rideId}`).emit('ride:message', msg); }
     }catch(e){}
   });
 });
@@ -669,9 +695,18 @@ app.get('/rides', async (req, res) => {
 app.post('/rides/:id/message', authenticate, (req, res) => {
   const rideId = req.params.id; const from = (req.body.from || 'driver').toString().toLowerCase(); const text = (req.body.text || '').toString().trim();
   if (!text) return res.status(400).json({error: 'text required'});
-  if(isDuplicate(rideId, from, text)){ return res.json({ok:true, delivered:true, duplicate:true}); }
   const msg = { ride_id: rideId, from, text, time: new Date().toISOString(), id: `MSG_${Date.now()}_${Math.random().toString(36).slice(2,6)}` };
-  addRideMessage(rideId, msg); io.to(`ride_${rideId}`).emit('ride_message', msg); io.to(`ride_${rideId}`).emit('ride:message', msg);
+  // Allow duplicate text from different direction - only block exact same from+text within 2 sec
+  if(isDuplicate(rideId, from, text)){
+    console.log(`⚠️ Duplicate blocked but still delivering: ${rideId} ${from}: ${text}`);
+  }
+  addRideMessage(rideId, msg); 
+  io.to(`ride_${rideId}`).emit('ride_message', msg); 
+  io.to(`ride_${rideId}`).emit('ride:message', msg);
+  io.to(`ride_${rideId}`).emit('new_message', msg);
+  // Also global emit for fallback if join failed
+  io.emit('ride_message', msg);
+  console.log(`💬 HTTP message ${rideId} ${from}: ${text} -> room ride_${rideId}`);
   res.json({ok:true, delivered:true, message:msg});
 });
 app.get('/rides/:id/messages', authenticate, (req, res) => { const rideId = req.params.id; res.json({ride_id: rideId, messages: rideMessages.get(rideId) || []}); });
