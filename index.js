@@ -607,17 +607,24 @@ app.get('/rides', async (req, res) => {
 
 
 
-// ---- RIDE MESSAGES (in-app, disappears after ride) ----
+// ---- RIDE MESSAGES (in-app, disappears after ride) - FIXED DEDUP ----
 app.post('/rides/:id/message', authenticate, (req, res) => {
   const rideId = req.params.id;
   const from = (req.body.from || 'driver').toString().toLowerCase();
   const text = (req.body.text || '').toString().trim();
   if (!text) return res.status(400).json({error: 'text required'});
+  // DEDUP: if same text from same sender within 3 sec, ignore
+  const existing = rideMessages.get(rideId) || [];
+  const last = existing[existing.length-1];
+  if (last && last.text === text && last.from === from && (Date.now() - new Date(last.time).getTime()) < 3000) {
+    console.log(`⚠ Duplicate msg ignored ${rideId} ${from}: ${text}`);
+    return res.json({ok:true, delivered:true, duplicate:true});
+  }
   const msg = { ride_id: rideId, from, text, time: new Date().toISOString() };
   addRideMessage(rideId, msg);
+  // Emit ONLY once to ride_ room (covers both driver & customer who joined)
   io.to(`ride_${rideId}`).emit('ride_message', msg);
-  io.to(rideId).emit('ride_message', msg);
-  io.to(`ride_${rideId}`).emit('new_message', msg);
+  io.to(rideId).emit('ride_message', msg); // fallback for old clients
   console.log(`💬 Ride ${rideId} ${from}: ${text}`);
   res.json({ok:true, delivered:true, message:msg});
 });
