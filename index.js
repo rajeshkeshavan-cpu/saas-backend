@@ -66,83 +66,35 @@ function getDriverIdFromToken(token) {
   try { const decoded = jwt.verify(token, JWT_SECRET); if (decoded && decoded.driver_id) return decoded.driver_id; } catch(e) {}
   return token;
 }
-
-// ========== DRIVER LOGIN FIX - MULTIPLE ENDPOINTS TO COVER auth_screens.dart ==========
 async function driverLoginHandler(req, res){
   try{
     const body = req.body || {};
     const phone = (body.phone || body.phone_number || body.mobile || '').toString().trim();
     const pin = (body.pin || body.PIN || body.password || body.pin_code || '').toString().trim();
     const pin_hash_input = body.pin_hash || '';
-    console.log(`🔐 Login attempt phone=${phone} pin_len=${pin.length} has_hash=${!!pin_hash_input}`);
+    console.log(`🔐 Login attempt phone=${phone} pin_len=${pin.length}`);
     if(!phone) return res.status(400).json({error:'Phone required'});
     if(!supabase) return res.status(500).json({error:'Supabase not configured'});
-    
     const { data: driver, error } = await supabase.from('drivers').select('*').eq('phone', phone).maybeSingle();
-    if(error){ console.log('Supabase error', error.message); return res.status(500).json({error:error.message}); }
-    if(!driver){ console.log('Driver not found for phone', phone); return res.status(404).json({error:'Driver not found. Register first.'}); }
-    
-    // Verify PIN - support plain 4-digit PIN vs bcrypt hash
+    if(error){ return res.status(500).json({error:error.message}); }
+    if(!driver){ return res.status(404).json({error:'Driver not found. Register first.'}); }
     let ok = false;
     if(pin){
       try{
         if(driver.pin_hash && driver.pin_hash.startsWith('$2')){
           ok = await bcrypt.compare(pin, driver.pin_hash);
-          if(!ok){
-            // Also try direct match with stored hash as plain (some old accounts)
-            // And try comparing pin as string
-            console.log('bcrypt compare failed, trying plain');
-          }
         }
-        // Fallback: if pin_hash is not bcrypt, direct compare
-        if(!ok && driver.pin_hash){
-          if(driver.pin_hash === pin) ok = true;
-        }
-        // Fallback: check if phone's redis PIN matches (old customer register flow)
-        if(!ok){
-          const redisData = await redis.hgetall(`driver:${phone}:pin`).catch(()=>null);
-          if(redisData && redisData.pin === pin) ok = true;
-        }
-        // SUPER ADMIN BYPASS - your numbers always work with any 4-digit for testing
-        if(!ok && ['9886180011','8431670039'].includes(phone) && pin.length===4){
-          console.log('SUPER ADMIN BYPASS for', phone);
-          ok = true;
-        }
+        if(!ok && driver.pin_hash){ if(driver.pin_hash === pin) ok = true; }
+        if(!ok && ['9886180011','8431670039'].includes(phone) && pin.length===4){ console.log('SUPER ADMIN BYPASS for', phone); ok = true; }
       }catch(e){ console.log('PIN verify error', e.message); }
-    } else if(pin_hash_input){
-      // If client already sends hash, compare directly
-      if(driver.pin_hash === pin_hash_input) ok = true;
-    }
-    
-    if(!ok){
-      console.log('Invalid PIN for', phone);
-      return res.status(401).json({error:'Invalid PIN. Use 4 digit PIN you set during registration.'});
-    }
-    
-    // Check status - allow VERIFIED and PENDING for login, block only REJECTED
-    if(driver.status === 'REJECTED'){
-      return res.status(403).json({error:'Account rejected: '+(driver.rejection_reason||'Contact support')});
-    }
-    
+    } else if(pin_hash_input){ if(driver.pin_hash === pin_hash_input) ok = true; }
+    if(!ok){ return res.status(401).json({error:'Invalid PIN.'}); }
+    if(driver.status === 'REJECTED'){ return res.status(403).json({error:'Account rejected: '+(driver.rejection_reason||'Contact support')}); }
     const tokenPayload = { driver_id: driver.driver_id, phone: driver.phone, name: driver.name };
     const token = jwt.sign(tokenPayload, JWT_SECRET, {expiresIn:'30d'});
-    
-    // Return in multiple formats to match different app expectations
-    res.json({
-      success:true,
-      token: token,
-      access_token: token,
-      driver: driver,
-      data: { token, driver },
-      message:'Login successful'
-    });
-  }catch(e){
-    console.error('Login error', e);
-    res.status(500).json({error:e.message});
-  }
+    res.json({ success:true, token: token, access_token: token, driver: driver, data: { token, driver }, message:'Login successful' });
+  }catch(e){ console.error('Login error', e); res.status(500).json({error:e.message}); }
 }
-
-// Register all possible login routes that auth_screens.dart might call
 app.post('/driver/login', driverLoginHandler);
 app.post('/drivers/login', driverLoginHandler);
 app.post('/auth/driver/login', driverLoginHandler);
@@ -151,20 +103,14 @@ app.post('/driver/auth/login', driverLoginHandler);
 app.post('/login', driverLoginHandler);
 app.post('/api/driver/login', driverLoginHandler);
 app.post('/api/drivers/login', driverLoginHandler);
-
-// Driver registration - create new driver with PIN
 app.post('/driver/register', async (req,res)=>{
   try{
     const { phone, name, pin, vehicle_type, vehicle_number, pin_hash } = req.body;
     if(!phone || phone.length<10) return res.status(400).json({error:'Valid phone required'});
     if(!supabase) return res.status(500).json({error:'No supabase'});
-    
     let finalHash = pin_hash;
-    if(!finalHash && pin){
-      finalHash = await bcrypt.hash(pin.toString(), 10);
-    }
+    if(!finalHash && pin){ finalHash = await bcrypt.hash(pin.toString(), 10); }
     if(!finalHash) return res.status(400).json({error:'PIN required'});
-    
     const driver_id = `DRV_${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
     const { data, error } = await supabase.from('drivers').insert({
       driver_id, phone: phone.toString(), name: name||'Driver', pin_hash: finalHash,
@@ -172,13 +118,10 @@ app.post('/driver/register', async (req,res)=>{
       status: 'PENDING', police_verified:false
     }).select().maybeSingle();
     if(error) return res.status(500).json({error:error.message});
-    
     const token = jwt.sign({driver_id: data.driver_id, phone: data.phone}, JWT_SECRET, {expiresIn:'30d'});
     res.json({success:true, token, driver:data});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
-
-// ========== ADMIN V76 - LIVE MAP FIXED + DOCS + LOGIN FIX ==========
 app.get('/admin', (req, res) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
@@ -187,22 +130,21 @@ app.get('/admin', (req, res) => {
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>UrbanRide Admin V76 - Fixed Map + Login</title>
+<title>UrbanRide Admin V77 - Call Rider Fixed</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#f5f5f5}
 .header{background:#1B5E20;color:#fff;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap}
-.header h1{font-size:16px}
-.tabs{display:flex;gap:8px;margin-left:20px}
+.header h1{font-size:15px}
+.tabs{display:flex;gap:8px;margin-left:16px}
 .tab{padding:6px 14px;border-radius:20px;cursor:pointer;font-size:12px;font-weight:bold;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.3);color:#fff}
 .tab.active{background:#fff;color:#1B5E20}
 .stats{display:flex;gap:8px;font-size:11px;flex-wrap:wrap}
 .stat{background:rgba(255,255,255,0.15);padding:5px 10px;border-radius:20px}
-.main{height:calc(100vh - 50px);display:flex;position:relative}
-.sidebar{width:360px;background:#fff;border-right:1px solid #ddd;overflow-y:auto;padding:10px;z-index:2}
 .map-wrap{flex:1;position:relative;background:#e0e0e0}
 #map{position:absolute;top:0;left:0;right:0;bottom:0;width:100%;height:100%;z-index:1}
+.sidebar{width:360px;background:#fff;border-right:1px solid #ddd;overflow-y:auto;padding:10px;z-index:2}
 .card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:10px;margin-bottom:10px}
 .card h3{font-size:13px;margin-bottom:6px;color:#1B5E20}
 .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:bold;color:#fff}
@@ -220,14 +162,14 @@ th{background:#1B5E20;color:#fff;font-size:11px}
 </head>
 <body>
 <div class="header">
-  <div style="display:flex;align-items:center"><h1>🚕 Admin V76 - Login Fixed + Map Fixed</h1><div class="tabs"><div class="tab active" onclick="switchTab('live')">🗺️ Live Map</div><div class="tab" onclick="switchTab('drivers')">👥 Drivers DB</div><div class="tab" onclick="switchTab('docs')">📄 Docs</div></div></div>
-  <div class="stats"><div class="stat">🟢 Live: <span id="driverCount">0</span></div><div class="stat">🚕 Active: <span id="rideCount">0</span></div><div class="stat">💰 Today: ₹<span id="todayEarn">0</span></div><div class="stat">V76</div></div>
+  <div style="display:flex;align-items:center"><h1>🚕 Admin V77 - Call Rider Fix + Login</h1><div class="tabs"><div class="tab active" onclick="switchTab('live')">🗺️ Live Map</div><div class="tab" onclick="switchTab('drivers')">👥 Drivers DB</div><div class="tab" onclick="switchTab('docs')">📄 Docs</div></div></div>
+  <div class="stats"><div class="stat">🟢 Live: <span id="driverCount">0</span></div><div class="stat">🚕 Active: <span id="rideCount">0</span></div><div class="stat">💰 Today: ₹<span id="todayEarn">0</span></div><div class="stat">V77 CALL FIX</div></div>
 </div>
 <div class="view active" id="view-live" style="flex-direction:row;height:calc(100vh - 50px)">
   <div class="sidebar">
     <div class="card"><h3>🟢 Live Drivers (4s)</h3><div id="driversList">Loading...</div></div>
-    <div class="card"><h3>🚕 Recent Rides</h3><div id="ridesList">Loading...</div></div>
-    <div class="card"><h3>🔧 Fix</h3><button class="btn btn-blue" onclick="map.invalidateSize();loadDrivers();" style="font-size:10px">Fix Map - Click if blank</button><div id="debug" style="font-size:10px;margin-top:6px;color:#666"></div></div>
+    <div class="card"><h3>🚕 Recent Rides - customer_phone shown</h3><div id="ridesList">Loading...</div></div>
+    <div class="card"><h3>🔧 Fix</h3><button class="btn btn-blue" onclick="map.invalidateSize();loadDrivers();" style="font-size:10px">Fix Map</button><div id="debug" style="font-size:10px;margin-top:6px;color:#666"></div></div>
   </div>
   <div class="map-wrap"><div id="map"></div></div>
 </div>
@@ -243,7 +185,7 @@ th{background:#1B5E20;color:#fff;font-size:11px}
 const BACKEND = window.location.origin;
 let map = L.map('map', {zoomControl:true}).setView([12.9716, 77.5946], 12);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OSM', maxZoom:19 }).addTo(map);
-setTimeout(()=>{ map.invalidateSize(); console.log('map invalidated'); }, 500);
+setTimeout(()=>{ map.invalidateSize(); }, 500);
 setTimeout(()=>{ map.invalidateSize(); }, 1500);
 let driverMarkers = {};
 function switchTab(t){
@@ -261,7 +203,7 @@ async function loadDrivers(){
     const drivers = await res.json();
     document.getElementById('driverCount').textContent = drivers.length;
     const list = document.getElementById('driversList');
-    if(drivers.length===0) list.innerHTML='<div style="color:#999;font-size:12px">No live drivers - Go online from driver app</div>';
+    if(drivers.length===0) list.innerHTML='<div style="color:#999;font-size:12px">No live drivers</div>';
     else list.innerHTML = drivers.map(d => \`
       <div class="ride-item"><div style="display:flex;justify-content:space-between"><b>\${d.driver_id}</b><span class="badge badge-online">ONLINE</span></div>
       <div style="font-size:11px">\${parseFloat(d.lat).toFixed(5)}, \${parseFloat(d.lng).toFixed(5)}</div>
@@ -274,7 +216,7 @@ async function loadDrivers(){
         driverMarkers[d.driver_id] = L.marker([lat,lng], {icon}).addTo(map).bindPopup(\`Driver \${d.driver_id}\`);
       }
     });
-    document.getElementById('debug').textContent = 'Map OK - ' + drivers.length + ' drivers - Last: ' + new Date().toLocaleTimeString();
+    document.getElementById('debug').textContent = 'Map OK - ' + drivers.length + ' drivers - ' + new Date().toLocaleTimeString();
   }catch(e){ document.getElementById('debug').textContent = 'Error: '+e.message; }
 }
 async function loadRides(){
@@ -288,7 +230,7 @@ async function loadRides(){
     document.getElementById('todayEarn').textContent=todayEarn;
     const list=document.getElementById('ridesList');
     if(rides.length===0){list.innerHTML='<div style="color:#999">No rides</div>';return;}
-    list.innerHTML=rides.slice(0,15).map(r=>{const st=(r.status||'UNKNOWN').toUpperCase();return \`<div class="ride-item"><div style="display:flex;justify-content:space-between"><b>\${r.ride_id}</b><span class="badge badge-\${st}">\${st}</span></div><div>₹\${r.fare||0} • \${r.driver_id||'No driver'}</div><div style="font-size:10px;color:#666">\${r.from?.name||'Pickup'} → \${r.to?.name||'Drop'}</div></div>\`;}).join('');
+    list.innerHTML=rides.slice(0,15).map(r=>{const st=(r.status||'UNKNOWN').toUpperCase(); const phone=r.customer_phone||r.passenger_phone||''; return \`<div class="ride-item"><div style="display:flex;justify-content:space-between"><b>\${r.ride_id}</b><span class="badge badge-\${st}">\${st}</span></div><div>₹\${r.fare||0} • \${r.driver_id||'No driver'} • 📞 \${phone||'No phone'}</div><div style="font-size:10px;color:#666">\${r.from?.name||'Pickup'} → \${r.to?.name||'Drop'}</div></div>\`;}).join('');
   }catch(e){}
 }
 function focusDriver(lat,lng){ map.setView([lat,lng], 16); map.invalidateSize(); }
@@ -311,7 +253,7 @@ async function loadDocs(){
     const res = await fetch(BACKEND+'/admin/api/docs', {cache:'no-store'});
     const data = await res.json();
     const tbody=document.getElementById('docsTableBody');
-    if(!data.docs || data.docs.length===0){tbody.innerHTML='<tr><td colspan=9>No docs - drivers need to upload from app</td></tr>';return;}
+    if(!data.docs || data.docs.length===0){tbody.innerHTML='<tr><td colspan=9>No docs</td></tr>';return;}
     const byDriver={};
     data.docs.forEach(doc=>{ if(!byDriver[doc.driver_id]) byDriver[doc.driver_id]={}; byDriver[doc.driver_id][doc.doc_type]=doc; });
     tbody.innerHTML=Object.keys(byDriver).map(driverId=>{
@@ -481,6 +423,7 @@ io.on('connection', (socket) => {
     }catch(e){}
   });
 });
+// FIXED rides/request - ensures customer_phone is ALWAYS saved from multiple possible fields
 app.post('/rides/request', async (req, res) => {
   const { tenant_id, from, to, distance_km: client_distance, fare: client_fare, vehicle_type, eta_min, booked_for_other, passenger_name, passenger_phone, customer_pin: body_pin } = req.body;
   if (!from || !to) return res.status(400).json({ error: 'Pickup and drop are required' });
@@ -489,10 +432,25 @@ app.post('/rides/request', async (req, res) => {
   else { return res.status(400).json({ error: 'Please get fare quote first' }); }
   const ride_id = `RIDE_${Date.now()}`;
   const customer_pin = (body_pin || String(crypto.randomInt(1000, 10000))).toString();
-  const ride = { ride_id, tenant_id: tenant_id || 'TENANT_01', customer_id: req.body.customer_id || 'CUST_001', customer_phone: req.body.customer_phone || '', customer_pin, from, to, distance_km: fareData.distance_km, fare: fareData.total, fare_breakdown: fareData.breakdown, vehicle_type: vehicle_type || 'TAXI', eta_min: eta_min || null, booked_for_other: booked_for_other === true, passenger_name: passenger_name || null, passenger_phone: passenger_phone || null, status: 'REQUESTED', driver_id: null, created_at: new Date().toISOString() };
+  // FIX: Extract customer phone from MANY possible fields that customer app might send
+  const customer_phone = (req.body.customer_phone || req.body.customerPhone || req.body.phone || req.body.passenger_phone || req.body.passengerPhone || req.body.customer_mobile || passenger_phone || '').toString();
+  console.log(`📞 Ride request customer_phone extracted: '${customer_phone}' from body keys: ${Object.keys(req.body).join(',')}`);
+  const ride = { 
+    ride_id, tenant_id: tenant_id || 'TENANT_01', 
+    customer_id: req.body.customer_id || 'CUST_001', 
+    customer_phone: customer_phone,
+    passenger_phone: passenger_phone || customer_phone,
+    customer_pin, from, to, 
+    distance_km: fareData.distance_km, fare: fareData.total, fare_breakdown: fareData.breakdown, 
+    vehicle_type: vehicle_type || 'TAXI', eta_min: eta_min || null, 
+    booked_for_other: booked_for_other === true, 
+    passenger_name: passenger_name || null, 
+    passenger_phone: passenger_phone || customer_phone || null, 
+    status: 'REQUESTED', driver_id: null, created_at: new Date().toISOString() 
+  };
   rides.set(ride_id, ride);
   await redis.hset(`tenant:${ride.tenant_id}:rides`, ride_id, JSON.stringify(ride));
-  console.log(`🚕 Ride ${ride_id} Fare ₹${fareData.total} PIN ${customer_pin}`);
+  console.log(`🚕 Ride ${ride_id} Fare ₹${fareData.total} PIN ${customer_pin} Phone ${customer_phone}`);
   io.emit('ride:request', publicRide(ride));
   res.json({ success: true, ride });
 });
@@ -614,7 +572,7 @@ app.get('/driver/subscription', async (req, res) => {
     res.json({ blocked: false, plan: 'FREE_TRIAL', trial_rides_left: 3 });
   } catch(e){ res.status(500).json({ error: e.message }); }
 });
-app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V76 LOGIN FIX + MAP FIX + DEDUP + COMBINED ADMIN', supabase: !!supabase, timestamp: new Date().toISOString() }); });
-app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V76 LOGIN FIX + MAP FIX', admin:'/admin', login:'/driver/login' }));
+app.get('/health', (req,res) => { res.json({ status:'LIVE', version:'V77 CALL RIDER FIX + CUSTOMER PHONE + DEDUP + LOGIN', supabase: !!supabase, timestamp: new Date().toISOString() }); });
+app.get('/', (req,res) => res.json({ status:'UrbanRide Backend LIVE', version:'V77 CALL RIDER FIX', admin:'/admin', login:'/driver/login' }));
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V76 LOGIN FIX + MAP FIX - PORT ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`✅ Backend V77 CALL RIDER FIX - PORT ${PORT}`));
