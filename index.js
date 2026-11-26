@@ -437,6 +437,29 @@ app.post('/customer/register', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+
+app.post('/admin/customer/:phone/reset-pin', async (req, res) => {
+  try {
+    const phone = req.params.phone?.toString().trim();
+    const { pin } = req.body || {};
+    const newPin = (pin || '1234').toString().trim();
+    if (!phone || phone.length != 10) return res.status(400).json({ error: '10 digit required' });
+    const existing = await redis.hgetall(`customer:${phone}`);
+    await redis.hset(`customer:${phone}`, { pin: newPin, phone, name: existing.name || 'Customer', created: existing.created || new Date().toISOString() });
+    res.json({ success: true, phone, pin: newPin, message: 'PIN reset' });
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
+
+app.get('/admin/customer/:phone', async (req, res) => {
+  try {
+    const phone = req.params.phone?.toString().trim();
+    const data = await redis.hgetall(`customer:${phone}`);
+    if (!data || !data.phone) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true, customer: data });
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
+
+
 app.post('/customer/login', async (req, res) => {
   try {
     let { phone, name, pin } = req.body;
@@ -669,73 +692,6 @@ app.post('/rides/:id/cancel', async (req, res) => {
   rides.set(ride.ride_id, ride); await redis.hset(`tenant:${ride.tenant_id}:rides`, ride.ride_id, JSON.stringify(ride));
   clearRideMessages(ride.ride_id); io.emit('ride:cancelled', publicRide(ride)); io.to(`ride_${ride.ride_id}`).emit('ride:cancelled', publicRide(ride));
   res.json({ success: true, ride: publicRide(ride) });
-});
-// POST /rides/:rideId/rating - Save customer rating for driver
-app.post('/rides/:rideId/rating', async (req, res) => {
-  try {
-    const { rideId } = req.params;
-    const { driver_id, rating, customer_phone } = req.body;
-    
-    if (!driver_id || !rating) {
-      return res.status(400).json({ error: 'driver_id and rating required' });
-    }
-    
-    const r = Math.min(5, Math.max(1, parseInt(rating)));
-    
-    // Insert rating
-    const { data: ratingData, error: ratingError } = await supabase
-      .from('driver_ratings')
-      .insert({
-        ride_id: rideId,
-        driver_id: driver_id,
-        customer_phone: customer_phone || null,
-        rating: r
-      })
-      .select()
-      .single();
-    
-    if (ratingError) {
-      console.error('Rating insert error:', ratingError);
-      return res.status(500).json({ error: ratingError.message });
-    }
-    
-    // Update driver aggregated stats
-    const { data: existing } = await supabase
-      .from('drivers')
-      .select('rating_avg, rating_count, rating_1_count, rating_2_count, rating_3_count, rating_4_count, rating_5_count')
-      .eq('driver_id', driver_id)
-      .single();
-    
-    const count = (existing?.rating_count || 0) + 1;
-    const currentAvg = existing?.rating_avg || 5.0;
-    const newAvg = ((currentAvg * (count - 1)) + r) / count;
-    
-    const updates = {
-      rating_avg: parseFloat(newAvg.toFixed(2)),
-      rating_count: count,
-    };
-    updates[`rating_${r}_count`] = (existing?.[`rating_${r}_count`] || 0) + 1;
-    
-    await supabase.from('drivers').update(updates).eq('driver_id', driver_id);
-    
-    console.log(`Rating saved: driver ${driver_id} got ${r} stars for ride ${rideId}, new avg ${newAvg.toFixed(2)} (${count} ratings)`);
-    
-    res.json({ success: true, rating: ratingData, driver_avg: newAvg, driver_count: count });
-  } catch (e) {
-    console.error('Rating error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /drivers/:id/ratings - Get driver rating breakdown
-app.get('/drivers/:id/ratings', async (req, res) => {
-  try {
-    const { data: driver } = await supabase.from('drivers').select('driver_id, name, rating_avg, rating_count, rating_1_count, rating_2_count, rating_3_count, rating_4_count, rating_5_count').eq('driver_id', req.params.id).single();
-    const { data: recent } = await supabase.from('driver_ratings').select('*').eq('driver_id', req.params.id).order('created_at', { ascending: false }).limit(20);
-    res.json({ driver, recent_ratings: recent || [] });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
 });
 app.post('/rides/:id/arrived', async (req, res) => {
   const ride = await getRide(req.params.id); if (!ride) return res.status(404).json({error: 'Ride not found'});
