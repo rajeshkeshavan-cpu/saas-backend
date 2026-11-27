@@ -506,5 +506,45 @@ app.get('/drivers/compliance/:id', async(req,res)=>{
 // ========== END DOCS FIX ==========
 
 
+
+// ========== ADMIN DOCS ENDPOINT FOR DOCUMENTS PAGE ==========
+app.get('/admin/driver/:driverId/docs', async(req,res)=>{
+  try{
+    const {driverId} = req.params;
+    const docs = [];
+    // Check both _govtStore and _docsStore
+    const govt = _govtStore[driverId] || {};
+    const dstore = _docsStore[driverId] || {};
+    const all = {...govt, ...dstore};
+    for(const [type, data] of Object.entries(all)){
+      docs.push({ doc_type:type, type, url:data.url||data, status:data.status||'PENDING', doc_url:data.url });
+    }
+    // If no docs, return empty but ok
+    res.json({ ok:true, driver_id:driverId, docs, driver_documents:docs });
+  }catch(e){ res.status(500).json({ok:false,error:e.message}); }
+});
+app.get('/admin/drivers/:driverId/docs', async(req,res)=>{
+  const {driverId} = req.params;
+  const docs = [];
+  const govt = _govtStore[driverId] || {};
+  const dstore = _docsStore[driverId] || {};
+  const all = {...govt, ...dstore};
+  for(const [type, data] of Object.entries(all)){
+    docs.push({ doc_type:type, type, url:data.url||data, status:data.status||'PENDING' });
+  }
+  res.json({ ok:true, docs, driver_documents:docs });
+});
+app.get('/driver/me/docs', async(req,res)=>{
+  const token = (req.headers.authorization||"").replace("Bearer ","") || "DRV_E90F74";
+  const docs = [];
+  const all = {...(_govtStore[token]||{}), ...(_docsStore[token]||{})};
+  for(const [type, data] of Object.entries(all)){
+    docs.push({ doc_type:type, type, doc_url:data.url, url:data.url, status:data.status||'PENDING' });
+  }
+  res.json({ ok:true, docs, driver_documents:docs });
+});
+// ========== END ADMIN DOCS ==========
+
+
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`Backend LIVE on ${PORT}`));
